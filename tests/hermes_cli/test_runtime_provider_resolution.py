@@ -238,6 +238,37 @@ def test_resolve_runtime_provider_ai_gateway(monkeypatch):
     assert resolved["requested_provider"] == "ai-gateway"
 
 
+def test_resolve_runtime_provider_kimi_uses_oauth_chat_mode(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "kimi-coding")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "kimi-coding",
+            "base_url": "https://api.kimi.com/coding/v1",
+            "default": "kimi-k2.6",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_api_key_provider_credentials",
+        lambda provider: {
+            "provider": provider,
+            "api_key": "oauth-token",
+            "base_url": "https://api.kimi.com/coding/v1",
+            "source": "kimi-cli-oauth",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="kimi-coding")
+
+    assert resolved["provider"] == "kimi-coding"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "https://api.kimi.com/coding/v1"
+    assert resolved["api_key"] == "oauth-token"
+    assert resolved["source"] == "kimi-cli-oauth"
+
+
 def test_resolve_runtime_provider_ai_gateway_explicit_override_skips_pool(monkeypatch):
     def _unexpected_pool(provider):
         raise AssertionError(f"load_pool should not be called for {provider}")

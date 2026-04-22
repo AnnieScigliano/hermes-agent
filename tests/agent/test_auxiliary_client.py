@@ -1413,3 +1413,15 @@ class TestAuxiliaryAuthRefreshRetry:
         mock_refresh.assert_called_once_with("anthropic")
         assert stale_client.chat.completions.create.await_count == 1
         assert fresh_client.chat.completions.create.await_count == 1
+class TestKimiCodingDefaultHeaders:
+    """kimi_coding_default_headers produces the full X-Msh-* header set."""
+
+    def test_headers_include_required_fields(self):
+        from hermes_cli.auth import kimi_coding_default_headers
+        headers = kimi_coding_default_headers()
+        assert headers["User-Agent"].startswith("KimiCLI/")
+        assert headers["X-Msh-Platform"] == "kimi_cli"
+        assert "X-Msh-Version" in headers
+        assert "X-Msh-Device-Name" in headers
+        assert "X-Msh-Device-Model" in headers
+        assert "X-Msh-Os-Version" in headers
