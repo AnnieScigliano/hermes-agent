@@ -10851,7 +10851,9 @@ class AIAgent:
                 env=get_active_env(effective_task_id),
             ) if not _is_multimodal_tool_result(function_result) else function_result
 
-            subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
+            subdir_hints = None
+            if self._subdirectory_hints:
+                subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
             if subdir_hints:
                 if _is_multimodal_tool_result(function_result):
                     # Append the hint to the text summary part so the model
@@ -11267,12 +11269,13 @@ class AIAgent:
             ) if not _is_multimodal_tool_result(function_result) else function_result
 
             # Discover subdirectory context files from tool arguments
-            subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
-            if subdir_hints:
-                if _is_multimodal_tool_result(function_result):
-                    _append_subdir_hint_to_multimodal(function_result, subdir_hints)
-                else:
-                    function_result += subdir_hints
+            if self._subdirectory_hints:
+                subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
+                if subdir_hints:
+                    if _is_multimodal_tool_result(function_result):
+                        _append_subdir_hint_to_multimodal(function_result, subdir_hints)
+                    else:
+                        function_result += subdir_hints
 
             # Unwrap _multimodal dicts to an OpenAI-style content list
             # (see parallel path for rationale). String results pass through.
