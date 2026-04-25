@@ -1334,9 +1334,8 @@ class AIAgent:
 
                     client_kwargs["default_headers"] = copilot_default_headers()
                 elif base_url_host_matches(effective_base, "api.kimi.com"):
-                    client_kwargs["default_headers"] = {
-                        "User-Agent": "claude-code/0.1.0",
-                    }
+                    from hermes_cli.auth import kimi_coding_default_headers
+                    client_kwargs["default_headers"] = kimi_coding_default_headers()
                 elif base_url_host_matches(effective_base, "portal.qwen.ai"):
                     client_kwargs["default_headers"] = _qwen_portal_headers()
                 elif base_url_host_matches(effective_base, "chatgpt.com"):
@@ -4769,6 +4768,10 @@ class AIAgent:
         if self._memory_store:
             self._memory_store.load_from_disk()
 
+    def _responses_tools(self, tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
+        """Convert chat-completions tool schemas to Responses function-tool schemas."""
+        return _codex_responses_tools(tools if tools is not None else self.tools)
+
     @staticmethod
     def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
         """Generate a deterministic call_id from tool call content.
@@ -4791,6 +4794,33 @@ class AIAgent:
     ) -> str:
         """Build a valid Responses `function_call.id` (must start with `fc_`)."""
         return _codex_derive_responses_function_call_id(call_id, response_item_id)
+
+    def _chat_messages_to_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert internal chat-style messages to Responses input items."""
+        return _codex_chat_messages_to_responses_input(messages)
+
+    def _preflight_codex_input_items(self, raw_items: Any) -> List[Dict[str, Any]]:
+        return _codex_preflight_codex_input_items(raw_items)
+
+    def _preflight_codex_api_kwargs(
+        self,
+        api_kwargs: Any,
+        *,
+        allow_stream: bool = False,
+    ) -> Dict[str, Any]:
+        return _codex_preflight_codex_api_kwargs(api_kwargs, allow_stream=allow_stream)
+
+    def _extract_responses_message_text(self, item: Any) -> str:
+        """Extract assistant text from a Responses message output item."""
+        return _codex_extract_responses_message_text(item)
+
+    def _extract_responses_reasoning_text(self, item: Any) -> str:
+        """Extract a compact reasoning text from a Responses reasoning item."""
+        return _codex_extract_responses_reasoning_text(item)
+
+    def _normalize_codex_response(self, response: Any) -> tuple[Any, str]:
+        """Normalize a Responses API object to an assistant_message-like object."""
+        return _codex_normalize_codex_response(response)
 
     def _thread_identity(self) -> str:
         thread = threading.current_thread()
@@ -5457,6 +5487,41 @@ class AIAgent:
         logger.info("Copilot credentials refreshed from %s", token_source)
         return True
 
+    def _try_refresh_kimi_client_credentials(self, *, force: bool = True) -> bool:
+        if self.provider not in {"kimi-coding", "kimi-coding-cn"} and not base_url_host_matches(self.base_url, "api.kimi.com"):
+            return False
+
+        try:
+            from hermes_cli.auth import resolve_kimi_coding_runtime_credentials, kimi_coding_default_headers
+
+            creds = resolve_kimi_coding_runtime_credentials(
+                force_refresh=force,
+                allow_api_key_fallback=False,
+            )
+        except Exception as exc:
+            logger.debug("Kimi credential refresh failed: %s", exc)
+            return False
+
+        api_key = creds.get("api_key")
+        base_url = creds.get("base_url")
+        source = str(creds.get("source") or "")
+        if source not in {"kimi-cli-oauth", "kimi-cli-oauth-refresh"}:
+            return False
+        if not isinstance(api_key, str) or not api_key.strip():
+            return False
+        if not isinstance(base_url, str) or not base_url.strip():
+            return False
+
+        self.api_key = api_key.strip()
+        self.base_url = base_url.strip().rstrip("/")
+        self._client_kwargs["api_key"] = self.api_key
+        self._client_kwargs["base_url"] = self.base_url
+        self._client_kwargs["default_headers"] = kimi_coding_default_headers()
+
+        if not self._replace_primary_openai_client(reason="kimi_credential_refresh"):
+            return False
+        return True
+
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         if self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key"):
             return False
@@ -5517,7 +5582,8 @@ class AIAgent:
 
             self._client_kwargs["default_headers"] = copilot_default_headers()
         elif base_url_host_matches(base_url, "api.kimi.com"):
-            self._client_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+            from hermes_cli.auth import kimi_coding_default_headers
+            self._client_kwargs["default_headers"] = kimi_coding_default_headers()
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
         elif base_url_host_matches(base_url, "chatgpt.com"):
@@ -9974,6 +10040,7 @@ class AIAgent:
             anthropic_auth_retry_attempted=False
             nous_auth_retry_attempted=False
             copilot_auth_retry_attempted=False
+            kimi_auth_retry_attempted=False
             thinking_sig_retry_attempted = False
             has_retried_429 = False
             restart_with_compressed_messages = False
@@ -10038,7 +10105,6 @@ class AIAgent:
                         _sanitize_structure_non_ascii(api_kwargs)
                     if self.api_mode == "codex_responses":
                         api_kwargs = self._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
-
                     try:
                         from hermes_cli.plugins import invoke_hook as _invoke_hook
                         _invoke_hook(
@@ -10947,6 +11013,18 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}🔐 Copilot credentials refreshed after 401. Retrying request...")
                             continue
                     if (
+                        status_code == 401
+                        and not kimi_auth_retry_attempted
+                        and (
+                            self.provider in {"kimi-coding", "kimi-coding-cn"}
+                            or base_url_host_matches(self.base_url, "api.kimi.com")
+                        )
+                    ):
+                        kimi_auth_retry_attempted = True
+                        if self._try_refresh_kimi_client_credentials(force=True):
+                            print(f"{self.log_prefix}🔐 Kimi OAuth refreshed after 401. Retrying request...")
+                            continue
+                    if (
                         self.api_mode == "anthropic_messages"
                         and status_code == 401
                         and hasattr(self, '_anthropic_api_key')
@@ -11674,8 +11752,7 @@ class AIAgent:
                     _normalize_kwargs["strip_tool_prefix"] = self._is_anthropic_oauth
                 normalized = _transport.normalize_response(response, **_normalize_kwargs)
                 assistant_message = normalized
-                finish_reason = normalized.finish_reason
-                
+                finish_reason = normalized.finish_reason                
                 # Normalize content to string — some OpenAI-compatible servers
                 # (llama-server, etc.) return content as a dict or list instead
                 # of a plain string, which crashes downstream .strip() calls.
@@ -12062,7 +12139,19 @@ class AIAgent:
                         except Exception:
                             pass
 
-                    self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    execute_tool_calls = self._execute_tool_calls
+                    try:
+                        import inspect as _inspect
+                        _execute_params = _inspect.signature(execute_tool_calls).parameters
+                        _accepts_api_call_count = len(_execute_params) >= 4 or any(
+                            p.kind == p.VAR_POSITIONAL for p in _execute_params.values()
+                        )
+                    except Exception:
+                        _accepts_api_call_count = True
+                    if _accepts_api_call_count:
+                        execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    else:
+                        execute_tool_calls(assistant_message, messages, effective_task_id)
 
                     # Reset per-turn retry counters after successful tool
                     # execution so a single truncation doesn't poison the

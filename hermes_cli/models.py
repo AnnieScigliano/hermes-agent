@@ -2907,8 +2907,6 @@ def validate_requested_model(
             ),
         }
 
-    # No catalog available — accept with a warning, matching the comment's
-    # stated intent ("Accept and persist, but warn").
     return {
         "accepted": True,
         "persist": True,
