@@ -463,7 +463,7 @@ class TestResolveApiKeyProviderCredentials:
             "hermes_cli.auth.resolve_kimi_coding_runtime_credentials",
             lambda: {
                 "provider": "kimi-coding",
-                "api_key": "***",
+                "api_key": "oauth-token",
                 "base_url": KIMI_CODE_BASE_URL,
                 "source": "kimi-cli-oauth",
             },

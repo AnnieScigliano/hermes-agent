@@ -3758,10 +3758,10 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     if provider_id in ("kimi-coding", "kimi-coding-cn"):
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
-        # Prefer the Kimi CLI OAuth session whenever we're resolving the Coding
-        # provider. This mirrors kimi-cli itself: ~/.kimi is the primary auth
-        # source for https://api.kimi.com/coding/v1.
-        if "api.kimi.com" in base_url or (not env_url and not api_key):
+        # Prefer the Kimi CLI OAuth session only when no explicit KIMI_API_KEY
+        # (or stored API key) is available. Explicit API keys must remain
+        # deterministic for tests and for users who intentionally choose them.
+        if not api_key and ("api.kimi.com" in base_url or not env_url):
             try:
                 oauth_creds = resolve_kimi_coding_runtime_credentials()
                 return {
