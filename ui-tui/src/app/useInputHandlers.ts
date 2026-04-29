@@ -380,6 +380,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
 
     if (isCtrl(key, ch, 'x') && cState.queueEditIdx !== null) {
       cActions.removeQueue(cState.queueEditIdx)
+
       return cActions.clearIn()
     }
 
@@ -407,6 +408,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     if (isAction(key, ch, 'l')) {
       clearSelection()
       forceRedraw(terminal.stdout ?? process.stdout)
+
       return
     }
 
