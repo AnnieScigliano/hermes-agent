@@ -545,8 +545,12 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
+        "protect_first_n": 3,         # messages from start to keep uncompressed (0 = only summary + tail)
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
-
+        "prompt": {
+            "preamble": "",           # optional custom summarizer preamble (empty = default)
+            "template": "",           # optional custom summary template (empty = default)
+        },
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
@@ -1067,7 +1071,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 22,
+    "_config_version": 23,
 }
 
 # =============================================================================
@@ -3930,6 +3934,7 @@ def show_config():
     if enabled:
         print(f"  Threshold:    {compression.get('threshold', 0.50) * 100:.0f}%")
         print(f"  Target ratio: {compression.get('target_ratio', 0.20) * 100:.0f}% of threshold preserved")
+        print(f"  Protect first: {compression.get('protect_first_n', 3)} messages")
         print(f"  Protect last: {compression.get('protect_last_n', 20)} messages")
         _aux_comp = config.get('auxiliary', {}).get('compression', {})
         _sm = _aux_comp.get('model', '') or '(auto)'
