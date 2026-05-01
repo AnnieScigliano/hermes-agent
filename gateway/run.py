@@ -11780,6 +11780,11 @@ class GatewayRunner:
                     logger.debug("Loaded system prompt from profile '%s' (%d chars)", _profile_name, len(_profile_system_prompt))
 
             if _profile_system_prompt:
+                # Profile overrides the global ephemeral system prompt, but keeps
+                # session context and per-channel context.
+                combined_ephemeral = (context_prompt or "").strip()
+                if event_channel_prompt:
+                    combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
                 combined_ephemeral = (combined_ephemeral + "\n\n" + _profile_system_prompt).strip()
             elif self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
