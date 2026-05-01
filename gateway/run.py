@@ -30,6 +30,7 @@ from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
+import copy
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -478,6 +479,60 @@ logger = logging.getLogger(__name__)
 # session from bypassing the "already running" guard during the async gap
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
+
+
+def _load_profile_config(profile_name: str) -> tuple[dict, Path]:
+    """Load config and .env from a Hermes profile directory.
+
+    Returns (config_dict, profile_dir).  Config is empty dict if the file
+    doesn't exist.  .env vars are injected into os.environ only when the
+    key is not already present (global ~/.hermes/.env takes precedence).
+    """
+    from hermes_cli.profiles import get_profile_dir, profile_exists
+
+    if not profile_exists(profile_name):
+        logger.warning("Profile '%s' does not exist — falling back to global config", profile_name)
+        return {}, Path()
+
+    profile_dir = get_profile_dir(profile_name)
+    config_path = profile_dir / "config.yaml"
+    config: dict = {}
+    if config_path.exists():
+        import yaml
+        try:
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            logger.warning("Failed to load profile config for '%s': %s", profile_name, exc)
+
+    # Load profile .env so credentials (MINIMAX_API_KEY, etc.) are available.
+    env_path = profile_dir / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                # Strip inline comments
+                in_quote = None
+                comment_idx = None
+                for i, ch in enumerate(value):
+                    if ch in ('"', "'"):
+                        if in_quote == ch:
+                            in_quote = None
+                        elif in_quote is None:
+                            in_quote = ch
+                    elif ch == "#" and in_quote is None and i > 0 and value[i - 1] == " ":
+                        comment_idx = i - 1
+                        break
+                if comment_idx is not None:
+                    value = value[:comment_idx].rstrip()
+                if key and key not in os.environ:
+                    os.environ[key] = value
+
+    return config, profile_dir
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -1275,6 +1330,29 @@ class GatewayRunner:
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config)
+
+        # If the source carries a Hermes profile, load its config and credentials
+        # so the agent uses the profile's model/provider/system_prompt instead of
+        # the gateway global defaults.
+        profile_config = {}
+        profile_name = getattr(source, "profile", None) if source else None
+        if profile_name:
+            profile_config, _ = _load_profile_config(profile_name)
+            if profile_config:
+                logger.debug(
+                    "Loaded profile '%s' for session %s",
+                    profile_name, resolved_session_key or "",
+                )
+
+        # Merge profile config on top of global user_config for model resolution.
+        # Profile takes precedence for model/providers; global stays for display/tools.
+        merged_config = copy.deepcopy(user_config) if user_config else {}
+        if profile_config:
+            from hermes_cli.config import _deep_merge
+            merged_config = _deep_merge(merged_config, profile_config)
+            # Re-resolve model with profile config in scope
+            model = _resolve_gateway_model(merged_config)
+
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -1355,6 +1433,47 @@ class GatewayRunner:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
             )
+
+        # When a profile is configured, re-resolve runtime_kwargs so that
+        # profile-level provider credentials (api_key, base_url, etc.) are used.
+        if profile_config and profile_name:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+            from hermes_cli.auth import AuthError
+            try:
+                _requested = (profile_config.get("model") or {}).get("provider")
+                if not _requested and isinstance(profile_config.get("providers"), dict):
+                    # Pick the first provider block that has a 'provider' key
+                    for _pname, _pval in profile_config["providers"].items():
+                        if isinstance(_pval, dict) and _pval.get("provider"):
+                            _requested = _pval["provider"]
+                            break
+
+                # Extract explicit credentials from profile config (providers.<name>.api_key / base_url)
+                _provider_cfg = {}
+                if isinstance(profile_config.get("providers"), dict):
+                    if _requested and _requested in profile_config["providers"]:
+                        _provider_cfg = profile_config["providers"][_requested]
+                    else:
+                        # Fallback: use the first provider block
+                        _provider_cfg = next(iter(profile_config["providers"].values()), {})
+
+                profile_runtime = resolve_runtime_provider(
+                    requested=_requested,
+                    explicit_api_key=_provider_cfg.get("api_key"),
+                    explicit_base_url=_provider_cfg.get("base_url"),
+                )
+                if profile_runtime:
+                    runtime_kwargs.update(profile_runtime)
+                    logger.debug(
+                        "Applied runtime from profile '%s': provider=%s base_url=%s",
+                        profile_name,
+                        profile_runtime.get("provider"),
+                        profile_runtime.get("base_url"),
+                    )
+            except AuthError as auth_exc:
+                logger.warning("Profile '%s' auth failed: %s", profile_name, auth_exc)
+            except Exception as exc:
+                logger.debug("Could not resolve runtime for profile '%s': %s", profile_name, exc)
 
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
@@ -11638,7 +11757,31 @@ class GatewayRunner:
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
-            if self._ephemeral_system_prompt:
+
+            # If a Hermes profile is specified for this source, load its system
+            # prompt (from SOUL.md or agent.system_prompt) instead of the global
+            # gateway ephemeral prompt.
+            _profile_name = getattr(source, "profile", None)
+            _profile_system_prompt = ""
+            if _profile_name:
+                _profile_config, _profile_dir = _load_profile_config(_profile_name)
+                # 1. SOUL.md / AGENTS.md in the profile directory
+                if _profile_dir and _profile_dir.exists():
+                    for fname in ("SOUL.md", "AGENTS.md", ".cursorrules"):
+                        fpath = _profile_dir / fname
+                        if fpath.exists():
+                            _profile_system_prompt += "\n\n" + fpath.read_text(encoding="utf-8")
+                # 2. agent.system_prompt from profile config.yaml
+                _cfg_prompt = (_profile_config.get("agent") or {}).get("system_prompt", "")
+                if _cfg_prompt:
+                    _profile_system_prompt += "\n\n" + str(_cfg_prompt)
+                _profile_system_prompt = _profile_system_prompt.strip()
+                if _profile_system_prompt:
+                    logger.debug("Loaded system prompt from profile '%s' (%d chars)", _profile_name, len(_profile_system_prompt))
+
+            if _profile_system_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + _profile_system_prompt).strip()
+            elif self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
