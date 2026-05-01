@@ -11957,6 +11957,11 @@ class GatewayRunner:
 
             if agent is None:
                 # Config changed or first message — create fresh agent
+                # If a Hermes profile is active, skip loading global context files
+                # (SOUL.md, AGENTS.md, MEMORY.md) so the profile's system prompt
+                # is the only identity injected.
+                _profile_name = getattr(source, "profile", None)
+                _skip_context = bool(_profile_name)
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -11987,6 +11992,8 @@ class GatewayRunner:
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                     agent_identity=getattr(source, "profile", None) or None,
+                    skip_context_files=_skip_context,
+                    skip_memory=_skip_context,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
