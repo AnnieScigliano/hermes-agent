@@ -1305,6 +1305,52 @@ class GatewayRunner:
             )
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
+
+        # Profile-scoped config: if the message source carries a profile,
+        # load that profile's config.yaml and .env so the agent uses the
+        # correct model, provider and credentials.
+        _profile = getattr(source, "profile", None) if source else None
+        if _profile:
+            try:
+                _profile_home = Path.home() / ".hermes" / "profiles" / _profile
+                _profile_cfg_path = _profile_home / "config.yaml"
+                if _profile_cfg_path.exists():
+                    import yaml as _yaml
+                    with open(_profile_cfg_path, encoding="utf-8") as _f:
+                        _profile_cfg = _yaml.safe_load(_f) or {}
+                    _profile_model = _profile_cfg.get("model", {})
+                    _profile_default = _profile_model.get("default", model)
+                    _profile_provider = _profile_model.get("provider", runtime_kwargs.get("provider"))
+                    _profile_providers = _profile_cfg.get("providers", {})
+                    _provider_cfg = _profile_providers.get(_profile_provider, {})
+                    _profile_base_url = _provider_cfg.get("base_url", runtime_kwargs.get("base_url"))
+
+                    # Read API key from profile .env
+                    _profile_env_path = _profile_home / ".env"
+                    _profile_api_key = None
+                    if _profile_env_path.exists():
+                        _prov_upper = (_profile_provider or "").upper().replace("-", "_").replace("_OAUTH", "")
+                        _key_name = f"{_prov_upper}_API_KEY"
+                        with open(_profile_env_path, encoding="utf-8") as _ef:
+                            for line in _ef:
+                                if line.startswith(f"{_key_name}="):
+                                    _profile_api_key = line.split("=", 1)[1].strip()
+                                    break
+
+                    model = _profile_default or model
+                    runtime_kwargs = {
+                        "api_key": _profile_api_key or runtime_kwargs.get("api_key"),
+                        "base_url": _profile_base_url or runtime_kwargs.get("base_url"),
+                        "provider": _profile_provider or runtime_kwargs.get("provider"),
+                        "api_mode": runtime_kwargs.get("api_mode"),
+                        "command": runtime_kwargs.get("command"),
+                        "args": list(runtime_kwargs.get("args") or []),
+                        "credential_pool": runtime_kwargs.get("credential_pool"),
+                    }
+                    logger.info("Profile '%s' loaded: model=%s provider=%s", _profile, model, _profile_provider)
+            except Exception as _profile_exc:
+                logger.warning("Failed to load profile '%s' config: %s", _profile, _profile_exc)
+
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -11792,6 +11838,7 @@ class GatewayRunner:
                     gateway_session_key=session_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    agent_identity=getattr(source, "profile", None) or None,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
