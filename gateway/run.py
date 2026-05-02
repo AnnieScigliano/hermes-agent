@@ -7569,6 +7569,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                tool_choice=getattr(event, "tool_choice", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -14161,6 +14162,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        tool_choice: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -15340,7 +15342,7 @@ class GatewayRunner:
                     _run_message,
                     conversation_history=agent_history,
                     task_id=session_id,
-                    tool_choice=getattr(event, "tool_choice", None),
+                    tool_choice=tool_choice,
                 )
             finally:
                 unregister_gateway_notify(_approval_session_key)
