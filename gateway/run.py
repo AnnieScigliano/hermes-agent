@@ -5345,6 +5345,13 @@ class GatewayRunner:
                 return None
             return YuanbaoAdapter(config)
 
+        elif platform == Platform.DAEMONCRAFT:
+            from gateway.platforms.daemoncraft import DaemonCraftAdapter, check_daemoncraft_requirements
+            if not check_daemoncraft_requirements():
+                logger.warning("DaemonCraft: aiohttp not installed")
+                return None
+            return DaemonCraftAdapter(config)
+
         return None
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -5387,6 +5394,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            Platform.DAEMONCRAFT: "DAEMONCRAFT_ALLOWED_USERS",
         }
         platform_group_user_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -5413,6 +5421,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+            Platform.DAEMONCRAFT: "DAEMONCRAFT_ALLOW_ALL_USERS",
         }
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
         platform_allow_bots_map = {
@@ -7475,7 +7484,7 @@ class GatewayRunner:
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK and source.platform != Platform.DAEMONCRAFT:
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             if not os.getenv(env_key):
