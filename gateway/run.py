@@ -18460,6 +18460,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
 
             max_iterations = _current_max_iterations()
+            _agent_config = user_config.get("agent") or {}
+            try:
+                turn_timeout_seconds = int(_agent_config.get("turn_timeout_seconds") or 0) or None
+            except (TypeError, ValueError):
+                turn_timeout_seconds = None
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
@@ -18820,7 +18825,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
-                    turn_timeout_seconds=int(os.getenv("HERMES_TURN_TIMEOUT_SECONDS", "0")) or None,
+                    turn_timeout_seconds=turn_timeout_seconds,
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
