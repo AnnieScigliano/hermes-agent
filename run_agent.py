@@ -950,6 +950,7 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         turn_timeout_seconds: int = None,
+        agent_identity: str = None,
     ):
         """
         Initialize the AI Agent.
@@ -1001,6 +1002,7 @@ class AIAgent:
         self.model = model
         self.max_iterations = max_iterations
         self.turn_timeout_seconds = turn_timeout_seconds
+        self.agent_identity = agent_identity
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
