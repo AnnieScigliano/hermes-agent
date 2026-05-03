@@ -11991,7 +11991,6 @@ class GatewayRunner:
                     gateway_session_key=session_key,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
-                    agent_identity=getattr(source, "profile", None) or None,
                     skip_context_files=_skip_context,
                     skip_memory=_skip_context,
                 )

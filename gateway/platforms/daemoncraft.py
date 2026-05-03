@@ -62,6 +62,16 @@ class DaemonCraftAdapter(BasePlatformAdapter):
             config.extra = {}
         config.extra.setdefault("group_sessions_per_user", False)
 
+    def _group_chat_id(self, world: str = "world") -> str:
+        """Return a chat_id scoped to this bot so each bot has its own session."""
+        return f"{world}:{self._bot_username}"
+
+    def _is_group_chat_id(self, chat_id: str) -> bool:
+        """Check whether a chat_id is one of our group chat ids."""
+        return chat_id in self._world_names or any(
+            chat_id.startswith(w + ":") for w in self._world_names
+        )
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -248,7 +258,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
 
         # Route to the world broadcast session (group chat)
         source = self.build_source(
-            chat_id="world",
+            chat_id=self._group_chat_id(),
             chat_name="world",
             chat_type="group",
             user_id="quest_engine",
@@ -283,7 +293,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         logger.info("[DaemonCraft] Blueprint updated: %s", name)
 
         source = self.build_source(
-            chat_id="world",
+            chat_id=self._group_chat_id(),
             chat_name="world",
             chat_type="group",
             user_id="dashboard",
@@ -320,7 +330,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
 
         # Wake-up event: force an agent turn with tool_choice=required
         source = self.build_source(
-            chat_id="world",
+            chat_id=self._group_chat_id(),
             chat_name="world",
             chat_type="group",
             user_id="system",
@@ -421,7 +431,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
             return None
         source = SessionSource(
             platform=Platform.DAEMONCRAFT,
-            chat_id="world",
+            chat_id=self._group_chat_id(),
             chat_type="group",
             user_id=self._bot_username,
             thread_id="world",
@@ -471,8 +481,8 @@ class DaemonCraftAdapter(BasePlatformAdapter):
             chat_type = "dm"
             thread_id = None
         else:
-            # Group session per world
-            chat_id = world
+            # Group session per world, scoped to this bot
+            chat_id = self._group_chat_id(world)
             chat_type = "group"
             thread_id = world
             self._world_names.add(world)
@@ -510,7 +520,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         # _world_names is populated lazily from inbound broadcasts. If the gateway
         # initiates an outbound broadcast before any inbound from that world, this
         # will default to DM (whisper). For now the agent only replies to inbound.
-        is_group = chat_id in self._world_names
+        is_group = self._is_group_chat_id(chat_id)
         payload: dict[str, Any] = {"message": content}
 
         if is_group:
@@ -585,7 +595,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         return await self._copy_and_relay_tts(audio_path, chat_id)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        chat_type = "group" if chat_id in self._world_names else "dm"
+        chat_type = "group" if self._is_group_chat_id(chat_id) else "dm"
         return {"name": chat_id, "type": chat_type, "chat_id": chat_id}
 
 
