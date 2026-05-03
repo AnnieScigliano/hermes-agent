@@ -366,6 +366,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         """Classify heartbeat as 'context' or 'wake_up'.
 
         Wake-up triggers:
+        - Bot is stuck on a movement task (task_stuck in status)
         - Health decreased from previous known value
         - Nearby hostile entities (zombie, skeleton, creeper, spider)
         - Explicit damage events in events list
@@ -373,6 +374,12 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         status = data.get("status") or {}
         nearby = data.get("nearby") or {}
         events = data.get("events") or []
+
+        # Stuck on movement task — force wake_up so agent can react
+        task_stuck = status.get("task_stuck")
+        if task_stuck:
+            events.append(f"Stuck: {task_stuck}")
+            return "wake_up"
 
         # Damage / health drop
         current_health = status.get("health")
