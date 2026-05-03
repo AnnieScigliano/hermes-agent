@@ -949,6 +949,7 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
+        turn_timeout_seconds: int = None,
     ):
         """
         Initialize the AI Agent.
@@ -999,6 +1000,7 @@ class AIAgent:
 
         self.model = model
         self.max_iterations = max_iterations
+        self.turn_timeout_seconds = turn_timeout_seconds
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
@@ -10658,6 +10660,7 @@ class AIAgent:
             except Exception:
                 pass
 
+        _turn_start_time = time.time()
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
@@ -10669,6 +10672,16 @@ class AIAgent:
                 if not self.quiet_mode:
                     self._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
                 break
+
+            # Check turn wall-clock timeout (DaemonCraft / long-turn guard)
+            if self.turn_timeout_seconds:
+                elapsed = time.time() - _turn_start_time
+                if elapsed > self.turn_timeout_seconds:
+                    interrupted = True
+                    _turn_exit_reason = "turn_timeout"
+                    if not self.quiet_mode:
+                        self._safe_print(f"\n⏰ Turn timed out after {elapsed:.1f}s (limit: {self.turn_timeout_seconds}s). Stopping...")
+                    break
             
             api_call_count += 1
             self._api_call_count = api_call_count
