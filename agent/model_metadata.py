@@ -217,6 +217,11 @@ DEFAULT_CONTEXT_LENGTHS = {
     "grok": 131072,             # catch-all (grok-beta, unknown grok-*)
     # Kimi
     "kimi": 262144,
+    "kimi-k2.6": 262144,
+    "kimi-k2.5": 262144,
+    "kimi-k2": 262144,
+    "k2p6": 262144,
+    "k2p5": 262144,
     # Tencent — Hy3 Preview (Hunyuan) with 256K context window.
     # OpenRouter live metadata reports 262144 (256 × 1024); align the
     # static fallback so cache and offline both agree (issue #22268).
@@ -1467,10 +1472,16 @@ def get_model_context_length(
         if ctx:
             return ctx
 
-    # 6. OpenRouter live API metadata (provider-unaware fallback)
-    metadata = fetch_model_metadata()
-    if model in metadata:
-        return metadata[model].get("context_length", DEFAULT_FALLBACK_CONTEXT)
+    # 6. OpenRouter live API metadata — provider-unaware fallback.
+    # Only consulted when the provider is unknown (no effective_provider),
+    # because OpenRouter data is community-maintained and can be incorrect
+    # for models that belong to known providers with curated defaults.
+    if not effective_provider:
+        metadata = fetch_model_metadata()
+        if model in metadata:
+            return metadata[model].get("context_length", DEFAULT_FALLBACK_CONTEXT)
+
+    # 7. (reserved)
 
     # 8. Hardcoded defaults (fuzzy match — longest key first for specificity)
     # Only check `default_model in model` (is the key a substring of the input).
