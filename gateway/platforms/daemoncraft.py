@@ -284,19 +284,41 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         for entry in new_messages:
             self._last_seen_timestamp = max(self._last_seen_timestamp, entry.get("time", 0))
 
-        # Load known bots from env (same source as agent_loop.py)
-        known_bots = set(
-            u.strip().lower()
-            for u in os.getenv("MC_KNOWN_BOTS", self._bot_username).split(",")
-            if u.strip()
-        )
+        # Dynamically discover all known bots from cast configs.
+        # This is a live hook — no need to update .env files when bots change.
+        def _discover_known_bots() -> set[str]:
+            import yaml
+            from pathlib import Path as _Path
+            bots = set()
+            casts_dir = _Path.home() / "Projects" / "DaemonCraft" / "agents" / "casts"
+            try:
+                for cf in sorted(casts_dir.glob("*.yaml")):
+                    cfg = yaml.safe_load(cf.read_text()) or {}
+                    for a in cfg.get("agents", []):
+                        name = a.get("name", "")
+                        if name:
+                            bots.add(name.strip().lower())
+            except Exception:
+                pass
+            # Also check env override
+            override = os.getenv("MC_KNOWN_BOTS", "")
+            if override:
+                for u in override.split(","):
+                    u = u.strip().lower()
+                    if u:
+                        bots.add(u)
+            return bots
+
+        known_bots = _discover_known_bots()
 
         urgent_msgs = []
         accepted_msgs = []
         import re
 
-        # Build a regex that matches @username with word boundaries,
-        # tolerating trailing punctuation like @pamplinas, or @pamplinas!
+        # Build two regexes:
+        # 1. @username!  — URGENT interrupt (exclamation forces immediate response)
+        # 2. @username   — normal steer (queued, doesn't interrupt)
+        urgent_re = re.compile(rf"\b@{re.escape(self._bot_username.lower())}!", re.IGNORECASE)
         mention_re = re.compile(rf"\b@{re.escape(self._bot_username.lower())}\b", re.IGNORECASE)
 
         for entry in new_messages:
@@ -304,14 +326,16 @@ class DaemonCraftAdapter(BasePlatformAdapter):
             msg_text = entry.get("message", "")
             is_bot = from_user in known_bots
             mentions_bot = bool(mention_re.search(msg_text))
+            is_urgent = bool(urgent_re.search(msg_text))
 
             if is_bot and not mentions_bot:
                 continue  # Silently drop bot spam
 
             accepted_msgs.append(entry)
 
-            # Only human @mentions are urgent (bots never interrupt, even with @mention)
-            if mentions_bot and not is_bot:
+            # Only @username! (with exclamation) is urgent interrupt.
+            # @username without ! is steer — queued, doesn't abort current turn.
+            if is_urgent and not is_bot:
                 urgent_msgs.append(entry)
 
         # Interrupt the loop for urgent human @mentions before generating response
@@ -470,15 +494,15 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         event_type = self._classify_heartbeat_event(data)
         logger.info("[DaemonCraft] Heartbeat classified as: %s", event_type)
 
-        # Always inject synthetic perceive into session store
-        await self._inject_synthetic_perceive(data)
+        # Inject world state from the body (Gemma-Andy) instead of raw bot data
+        await self._inject_embodied_world_state(data)
 
         if event_type == "context":
             logger.debug("[DaemonCraft] Context-only heartbeat injected silently")
             return
 
-        # Cycle guard — skip wake-up if loop is repeating mc_perceive calls
-        if await self._check_cycle("mc_perceive", {}):
+        # Cycle guard — skip wake-up if loop is repeating embodied_plan calls
+        if await self._check_cycle("embodied_plan", {}):
             return
 
         # Wake-up event: force an agent turn with tool_choice=required
@@ -705,6 +729,86 @@ class DaemonCraftAdapter(BasePlatformAdapter):
 
         self._session_store.append_to_transcript(session_id, tool_msg)
         logger.info("[DaemonCraft] Synthetic mc_perceive injected into session %s", session_id)
+
+    async def _inject_embodied_world_state(self, data: dict) -> None:
+        """Query the body (Gemma-Andy via embodied service) for world state.
+
+        Instead of injecting raw bot data as synthetic mc_perceive, we ask the
+        body to scan the world and inject its processed response. This keeps
+        the architecture pure: Steve only knows the world through his body.
+        """
+        if not self._session_store:
+            logger.debug("[DaemonCraft] No session_store, skipping embodied injection")
+            return
+
+        session_id = self._get_world_session_id()
+        if not session_id:
+            logger.debug("[DaemonCraft] No world session, skipping embodied injection")
+            return
+
+        embodied_url = os.environ.get("EMBODIED_SERVICE_URL", "http://localhost:7790")
+        intent = (
+            "Scan the area. Report concisely: your position, the 5 most common "
+            "nearby blocks with counts, any entities (players, mobs) with distances, "
+            "inventory highlights (tools, key materials), and any hazards. "
+            "Keep the report under 600 characters."
+        )
+
+        tool_call_id = f"hb_{uuid.uuid4().hex[:12]}"
+        payload = None
+        ok = False
+        exc_info = None
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{embodied_url}/intent",
+                    json={"intent": intent, "autonomy_level": 1, "deadline_seconds": 15},
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        ok = body.get("ok", False)
+                        if ok and body.get("execution_results"):
+                            payload = json.dumps(body, ensure_ascii=False, default=str)
+                        elif body.get("plan", {}).get("body_plan"):
+                            payload = json.dumps(body["plan"], ensure_ascii=False, default=str)
+        except Exception as exc:
+            logger.warning("[DaemonCraft] Embodied world-state query failed: %s", exc)
+            exc_info = str(exc)
+
+        if not payload:
+            payload = json.dumps({
+                "_note": "Body unresponsive — do not act as if it is responding. Wait for the next heartbeat.",
+                "error": exc_info or "embodied service unavailable",
+            })
+
+        if len(payload) > 4000:
+            payload = payload[:4000] + "\n...[truncated]"
+
+        assistant_msg = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {"name": "embodied_plan", "arguments": json.dumps({"intent": intent})},
+                }
+            ],
+        }
+        tool_msg = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": payload,
+        }
+
+        self._session_store.append_to_transcript(session_id, assistant_msg)
+        self._session_store.append_to_transcript(session_id, tool_msg)
+        logger.info(
+            "[DaemonCraft] Embodied world-state injected (body ok=%s, %d chars) into session %s",
+            ok, len(payload), session_id,
+        )
 
     def _get_world_session_id(self) -> Optional[str]:
         """Resolve the session_id for the world broadcast session."""
