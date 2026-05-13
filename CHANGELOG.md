@@ -1,53 +1,74 @@
-# CHANGELOG — nicoechaniz/hermes-agent fork
+# Changelog — nicoechaniz/hermes-agent fork
 
-Team-facing summary of changes to our fork. For upstream changes between syncs,
-see `~/wiki/projects/hermes-agent/notes/upstream-changes-review.md`.
+Team-facing summary of changes to our fork. For branch topology and sync commands, see `FORK_WORKFLOW.md`.
 
----
+> Provider note: profile configs reference DeepSeek, Kimi, and MiniMax providers because that is our stack. Team members using different providers should adapt `model.provider`, `model.default`, and `model.base_url` in each profile's `config.yaml`. API keys go in each profile's `.env` or a symlinked shared `.env`.
 
-## 2026-05-11
+## 2026-05-13 — Kimi branch consolidation
 
-### Upstream sync (138 commits behind → caught up)
+### Branch workflow
 
-- `nousmain` reset to upstream/main (`8e2eb4b51`)
-- `main` merged with upstream (2 conflicts resolved: Kimi OAuth headers + ProviderProfile fallback)
-- `feat/daemoncraft` merged into `main` (5 commits: embodied heartbeat, @name! interrupt, compressor fix, embodied_plan, kanban-review)
-- Deployed to `~/.hermes/hermes-agent`, gateway restarted
+- Canonical Kimi branch is now `feat/kimi`.
+- `feat/kimi` is a clean patch stack over `nousmain`.
+- Superseded branches removed from `origin`:
+  - `feat/kimi-oauth-clean`
+  - `feat/kimi-oauth-clean-v3`
+  - `fix/kimi-context-length-resolution`
+- `main` is the integration branch: `nousmain` plus all active canonical feature branches.
+- Runtime deploy target `~/.hermes/hermes-agent` tracks `origin/main`.
 
-### Kimi K2.6 context window bug — fixed
+### Kimi support in `feat/kimi`
 
-**Problem:** Hermes rejected `kimi-k2.6` with "context window of 32,768 tokens, below minimum 64,000". Real context is 262,144 (256K).
+- Kimi CLI OAuth credentials are read from `~/.kimi/credentials/kimi-code.json` when `KIMI_API_KEY` is not set.
+- `KIMI_API_KEY` takes precedence over OAuth credentials when present.
+- `kimi-coding` supports both endpoints:
+  - `https://api.kimi.com/coding` via Anthropic Messages
+  - `https://api.kimi.com/coding/v1` via OpenAI Chat Completions
+- Kimi CLI-compatible `X-Msh-*` headers and user-agent are applied to Kimi requests.
+- Runtime provider resolution falls back to Kimi OAuth instead of silently producing `no-key-required`.
+- Auxiliary Kimi calls refresh OAuth credentials on 401.
+- Kimi K2.x context lengths are pinned to 262144 where needed and stale OpenRouter underreports are ignored for known providers.
 
-**Root cause:** Two issues in the context-length resolution chain (`agent/model_metadata.py`, `agent/models_dev.py`):
-1. `PROVIDER_TO_MODELS_DEV` was missing `"kimi"` and `"moonshot"` entries (only had `kimi-coding`/`kimi-coding-cn`)
-2. OpenRouter metadata (community-maintained, incorrect for kimi-k2.6) was consulted BEFORE the project's own curated `DEFAULT_CONTEXT_LENGTHS`
+### Verification
 
-**Fix (3 changes in 2 files):**
-1. Added `"kimi"` → `"kimi-for-coding"` and `"moonshot"` → `"kimi-for-coding"` to `PROVIDER_TO_MODELS_DEV`
-2. Gated OpenRouter fallback behind `not effective_provider` — known providers skip third-party metadata and go straight to curated defaults
-3. Added explicit `DEFAULT_CONTEXT_LENGTHS` entries for `kimi-k2.6`, `kimi-k2.5`, `kimi-k2`, `k2p6`, `k2p5` (all 262,144)
+- Focused tests: `scripts/run_tests.sh tests/hermes_cli/test_runtime_provider_resolution.py tests/agent/test_model_metadata.py -q --tb=short`
+- Kimi OAuth smoke: `hermes chat --provider kimi-coding -m kimi-k2.6 -q 'Say OK only.' -Q --yolo`
 
-**Result:** `provider: kimi` with `kimi-k2.6` now resolves to 262,144. No config workaround needed.
+## 2026-05-11 — Kimi K2.6 context window bug
 
-**PR upstream:** https://github.com/NousResearch/hermes-agent/pull/23950
-**Cherry-picked to:** `feat/kimi-oauth-clean`
+### Problem
 
-### Kanban cleanup
+Hermes rejected `kimi-k2.6` with a 32768-token context window even though the real context is 262144.
 
-- hermes-agent board had ~2,778 synthetic test tasks from kanban development
-- DB backed up to `kanban.db.backup-20260511-145448`, then deleted
-- Fresh empty board auto-created on next CLI access
+### Root cause
 
-### Branches
+1. Provider mapping was incomplete for `kimi` / `moonshot` aliases.
+2. Provider-unaware OpenRouter metadata could be consulted before curated Hermes defaults.
 
-| Branch | Status | Notes |
-|--------|--------|-------|
-| `nousmain` | Clean | Tracks upstream/main exactly |
-| `main` | Integration | upstream + all our features |
-| `feat/daemoncraft` | Active | Consolidated DC work (needs rebase onto new nousmain) |
-| `feat/kimi-oauth-clean` | Active | Kimi OAuth + context-length fix |
-| `fix/kimi-context-length-resolution` | Merged to main | Kimi context window fix |
+### Fix
 
-### Pending
+- Added Kimi aliases to models.dev provider mapping.
+- Added explicit Kimi K2.x context-length defaults.
+- Kept provider-specific/curated context data ahead of provider-unaware OpenRouter fallback.
 
-- `feat/daemoncraft` is on the old base — needs rebase onto new `nousmain` on next sync cycle
+## 2026-05-09 — Multi-agent coding roster and Kanban hardening
+
+### Profiles
+
+- `riqui`: DeepSeek v4-flash, surgical Kanban worker.
+- `miki`: Kimi K2.6 via `kimi-coding` OAuth.
+- `maxi`: MiniMax provider, Anthropic Messages endpoint.
+- `compaii`: architecture/research profile.
+
+### Kanban fixes
+
+- Kanban worker tasks require explicit `toolsets` in task specs.
+- `kanban review create` flow validated end-to-end.
+- Auto-specify triage was added for malformed task specs.
+- Dispatcher self-spawn risk remains important: tasks assigned to the gateway's own profile must stay in `todo`/`triage` until intentionally claimed.
+
+## 2026-05-08 — Upstream sync v2026.5.7
+
+- Rebased fork work onto upstream main at the time.
+- Preserved local fork features.
+- Split gateway service handling between CompAII and profile-specific gateway instances.

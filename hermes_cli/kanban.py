@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_review as kr
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +83,7 @@ def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
     if not value:
         return ("scratch", None)
     v = value.strip()
-    if v in ("scratch", "worktree"):
+    if v in {"scratch", "worktree"}:
         return (v, None)
     if v.startswith("dir:"):
         path = v[len("dir:"):].strip()
@@ -619,6 +620,26 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- review (ship-review orchestration) ---
+    p_review = sub.add_parser(
+        "review",
+        help="Create a ship-review graph for a git change",
+    )
+    review_sub = p_review.add_subparsers(dest="review_action")
+    p_review_create = review_sub.add_parser(
+        "create",
+        help="Build a durable 5-card review graph (parent + 3 reviewers + synthesis)",
+    )
+    p_review_create.add_argument("title", help="Human title for the review")
+    p_review_create.add_argument("--base", required=True, help="Git base ref")
+    p_review_create.add_argument("--head", required=True, help="Git head ref")
+    p_review_create.add_argument("--repo-path", default=".", help="Path to repository (default: cwd)")
+    p_review_create.add_argument("--assignee", default=None, help="Profile to assign")
+    p_review_create.add_argument("--ready", action="store_true", help="Create cards in 'ready' instead of 'triage'")
+    p_review_create.add_argument("--skill", action="append", default=None, help="Skill to attach (repeatable)")
+    p_review_create.add_argument("--body", default=None, help="Extra context appended to parent body")
+    p_review_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -741,6 +762,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "context":  _cmd_context,
         "specify":  _cmd_specify,
         "gc":       _cmd_gc,
+        "review":   _cmd_review,
     }
     handler = handlers.get(action)
     if not handler:
@@ -788,15 +810,15 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     can still run ``boards create`` / ``boards list``.
     """
     sub = getattr(args, "boards_action", None) or "list"
-    if sub in ("list", "ls"):
+    if sub in {"list", "ls"}:
         return _cmd_boards_list(args)
-    if sub in ("create", "new"):
+    if sub in {"create", "new"}:
         return _cmd_boards_create(args)
-    if sub in ("rm", "remove", "delete"):
+    if sub in {"rm", "remove", "delete"}:
         return _cmd_boards_rm(args)
-    if sub in ("switch", "use"):
+    if sub in {"switch", "use"}:
         return _cmd_boards_switch(args)
-    if sub in ("show", "current"):
+    if sub in {"show", "current"}:
         return _cmd_boards_show(args)
     if sub == "rename":
         return _cmd_boards_rename(args)
@@ -1301,7 +1323,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 
 def _cmd_assign(args: argparse.Namespace) -> int:
-    profile = None if args.profile.lower() in ("none", "-", "null") else args.profile
+    profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
     if not ok:
@@ -1328,7 +1350,7 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
-    profile = None if args.profile.lower() in ("none", "-", "null") else args.profile
+    profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect() as conn:
         ok = kb.reassign_task(
             conn, args.task_id, profile,
@@ -2096,19 +2118,18 @@ def _cmd_specify(args: argparse.Namespace) -> int:
                 "reason": outcome.reason,
                 "new_title": outcome.new_title,
             }))
+        elif outcome.ok:
+            title_suffix = (
+                f" — retitled: {outcome.new_title!r}"
+                if outcome.new_title
+                else ""
+            )
+            print(f"Specified {outcome.task_id} → todo{title_suffix}")
         else:
-            if outcome.ok:
-                title_suffix = (
-                    f" — retitled: {outcome.new_title!r}"
-                    if outcome.new_title
-                    else ""
-                )
-                print(f"Specified {outcome.task_id} → todo{title_suffix}")
-            else:
-                print(
-                    f"kanban: specify {outcome.task_id}: {outcome.reason}",
-                    file=sys.stderr,
-                )
+            print(
+                f"kanban: specify {outcome.task_id}: {outcome.reason}",
+                file=sys.stderr,
+            )
     if not all_flag:
         return 0 if ok_count == 1 else 1
     # --all: succeed if at least one promotion landed; exit 1 only when
@@ -2154,6 +2175,52 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     )
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+    return 0
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    """Dispatch ``hermes kanban review <action>``."""
+    sub = getattr(args, "review_action", None)
+    if sub == "create":
+        return _cmd_review_create(args)
+    print("kanban review: unknown action. Use `hermes kanban review create --help`", file=sys.stderr)
+    return 2
+
+
+def _cmd_review_create(args: argparse.Namespace) -> int:
+    """Handle ``hermes kanban review create …``."""
+    import json as _json
+    from pathlib import Path
+    repo = Path(args.repo_path)
+    if not repo.exists() or not repo.is_dir():
+        print(f"kanban review: {args.repo_path} is not a directory", file=sys.stderr)
+        return 1
+    try:
+        result = kr.create_review_graph(
+            title=args.title,
+            base=args.base,
+            head=args.head,
+            repo_path=str(repo.resolve()),
+            assignee=args.assignee,
+            ready=args.ready,
+            skills=args.skill or [],
+            body=args.body,
+        )
+    except Exception as exc:
+        print(f"kanban review: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(_json.dumps(result, indent=2, default=str))
+    else:
+        if result["created"]:
+            print("Created review graph")
+        else:
+            print("Found existing review graph")
+            print("all cards already existed")
+        print(f"parent:    {result['parent_id']}")
+        for idx, rid in enumerate(result['reviewer_ids'], 1):
+            print(f"reviewer {idx}: {rid}")
+        print(f"synthesis: {result['synthesis_id']}")
     return 0
 
 
@@ -2231,7 +2298,7 @@ def run_slash(rest: str) -> str:
         out = buf_out.getvalue().rstrip()
         err = buf_err.getvalue().rstrip()
         # Help dump (exit 0) → return the captured help text directly.
-        if exc.code in (0, None) and out:
+        if exc.code in {0, None} and out:
             return out
         body = err or out
         return f"⚠ /kanban usage error\n{body}" if body else "⚠ /kanban usage error"

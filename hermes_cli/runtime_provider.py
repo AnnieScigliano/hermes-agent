@@ -78,7 +78,30 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
         return "codex_responses"
     if normalized.endswith("/anthropic"):
         return "anthropic_messages"
+    if hostname == "api.kimi.com" and normalized.endswith("/coding/v1"):
+        # Kimi Coding Plan exposes an OpenAI-compatible surface at
+        # /coding/v1/chat/completions. Older fork configs stored this URL
+        # directly; keep routing those sessions through chat_completions so
+        # the OpenAI SDK sends Bearer auth and default_headers are applied.
+        return "chat_completions"
+    if hostname == "api.kimi.com" and "/coding" in normalized:
+        return "anthropic_messages"
     return None
+
+
+def _try_kimi_oauth_credentials() -> Optional[Dict[str, Any]]:
+    """Return Kimi CLI OAuth credentials when available, otherwise None."""
+    try:
+        from hermes_cli.auth import resolve_kimi_coding_runtime_credentials
+
+        creds = resolve_kimi_coding_runtime_credentials()
+    except Exception:
+        return None
+    if not isinstance(creds, dict):
+        return None
+    if not str(creds.get("api_key") or "").strip():
+        return None
+    return creds
 
 
 def _auto_detect_local_model(base_url: str) -> str:
@@ -200,6 +223,14 @@ def _resolve_runtime_from_pool_entry(
     elif provider == "google-gemini-cli":
         api_mode = "chat_completions"
         base_url = base_url or "cloudcode-pa://google"
+    elif provider == "minimax-oauth":
+        # MiniMax OAuth tokens are valid only against the Anthropic Messages
+        # compatible endpoint. Do not honor stale model.api_mode values from a
+        # prior OpenAI-compatible provider, or the client will hit
+        # /chat/completions under /anthropic and receive a bare nginx 404.
+        api_mode = "anthropic_messages"
+        pconfig = PROVIDER_REGISTRY.get(provider)
+        base_url = base_url or (pconfig.inference_base_url if pconfig else "")
     elif provider == "anthropic":
         api_mode = "anthropic_messages"
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -255,7 +286,7 @@ def _resolve_runtime_from_pool_entry(
             if cfg_base_url:
                 base_url = cfg_base_url
         configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-        if provider in ("opencode-zen", "opencode-go"):
+        if provider in {"opencode-zen", "opencode-go"}:
             # Re-derive api_mode from the effective model rather than the
             # persisted api_mode: the opencode providers serve both
             # anthropic_messages and chat_completions models, so the previous
@@ -277,7 +308,7 @@ def _resolve_runtime_from_pool_entry(
     # Anthropic SDK prepends its own /v1/messages to the base_url.  Strip the
     # trailing /v1 so the SDK constructs the correct path (e.g.
     # https://opencode.ai/zen/go/v1/messages instead of .../v1/v1/messages).
-    if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
+    if api_mode == "anthropic_messages" and provider in {"opencode-zen", "opencode-go"}:
         base_url = re.sub(r"/v1/?$", "", base_url)
 
     return {
@@ -854,7 +885,7 @@ def _resolve_explicit_runtime(
 
         base_url = explicit_base_url
         if not base_url:
-            if provider in ("kimi-coding", "kimi-coding-cn"):
+            if provider in {"kimi-coding", "kimi-coding-cn"}:
                 creds = resolve_api_key_provider_credentials(provider)
                 base_url = creds.get("base_url", "").rstrip("/")
             else:
@@ -866,6 +897,15 @@ def _resolve_explicit_runtime(
             api_key = creds.get("api_key", "")
             if not base_url:
                 base_url = creds.get("base_url", "").rstrip("/")
+            # Kimi OAuth fallback: if no env API key, try reading kimi-cli credentials.
+            # This path is hit when the CLI passes an explicit base_url from config.yaml
+            # (for example the old /coding/v1 URL) but no KIMI_API_KEY is set.
+            if provider == "kimi-coding" and not api_key:
+                oauth_creds = _try_kimi_oauth_credentials()
+                if oauth_creds:
+                    api_key = str(oauth_creds.get("api_key", "") or "").strip()
+                    if not base_url:
+                        base_url = str(oauth_creds.get("base_url", "") or "").rstrip("/")
 
         api_mode = "chat_completions"
         if provider == "copilot":
@@ -1218,7 +1258,7 @@ def resolve_runtime_provider(
         # trust boto3's credential chain — it handles IMDS, ECS task roles,
         # Lambda execution roles, SSO, and other implicit sources that our
         # env-var check can't detect.
-        is_explicit = requested_provider in ("bedrock", "aws", "aws-bedrock", "amazon-bedrock", "amazon")
+        is_explicit = requested_provider in {"bedrock", "aws", "aws-bedrock", "amazon-bedrock", "amazon"}
         if not is_explicit and not has_aws_credentials():
             raise AuthError(
                 "No AWS credentials found for Bedrock. Configure one of:\n"
@@ -1279,24 +1319,24 @@ def resolve_runtime_provider(
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
-        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
-        cfg_base_url = ""
-        if cfg_provider == provider:
-            cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         creds = resolve_api_key_provider_credentials(provider)
-        if (
-            provider in ("kimi-coding", "kimi-coding-cn")
-            and not str(creds.get("api_key", "")).strip()
-            and "api.kimi.com" in cfg_base_url
-        ):
-            try:
-                creds = resolve_kimi_coding_runtime_credentials()
-            except AuthError:
-                pass
+        # Kimi Coding is fork-supported through the user's existing Kimi CLI
+        # OAuth session (~/.kimi/credentials/kimi-code.json). If no KIMI_API_KEY
+        # exists, use that OAuth token instead of returning an empty key that the
+        # CLI later replaces with no-key-required (which drops Kimi's required
+        # X-Msh headers and causes 404s).
+        if provider == "kimi-coding" and not str(creds.get("api_key", "") or "").strip():
+            oauth_creds = _try_kimi_oauth_credentials()
+            if oauth_creds:
+                creds = oauth_creds
         # Honour model.base_url from config.yaml when the configured provider
         # matches this provider — mirrors the Anthropic path above.  Without
         # this, users who set model.base_url to e.g. api.minimaxi.com/anthropic
         # (China endpoint) still get the hardcoded api.minimax.io default (#6039).
+        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+        cfg_base_url = ""
+        if cfg_provider == provider:
+            cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
         api_mode = "chat_completions"
         if provider == "copilot":
@@ -1307,7 +1347,7 @@ def resolve_runtime_provider(
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             # Only honor persisted api_mode when it belongs to the same provider family.
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if provider in ("opencode-zen", "opencode-go"):
+            if provider in {"opencode-zen", "opencode-go"}:
                 # opencode-zen/go must always re-derive api_mode from the
                 # target model (not the stale persisted api_mode), because
                 # the same provider serves both anthropic_messages
@@ -1329,7 +1369,7 @@ def resolve_runtime_provider(
                 if detected:
                     api_mode = detected
         # Strip trailing /v1 for OpenCode Anthropic models (see comment above).
-        if api_mode == "anthropic_messages" and provider in ("opencode-zen", "opencode-go"):
+        if api_mode == "anthropic_messages" and provider in {"opencode-zen", "opencode-go"}:
             base_url = re.sub(r"/v1/?$", "", base_url)
         return {
             "provider": provider,

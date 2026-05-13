@@ -284,7 +284,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
     ),
     "alibaba": ProviderConfig(
         id="alibaba",
-        name="Alibaba Cloud (DashScope)",
+        name="Qwen Cloud",
         auth_type="api_key",
         inference_base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         api_key_env_vars=("DASHSCOPE_API_KEY",),
@@ -481,9 +481,13 @@ def get_anthropic_key() -> str:
 # on api.kimi.com/coding.  Legacy keys from platform.moonshot.ai work on
 # api.moonshot.ai/v1 (the old default).  Auto-detect when user hasn't set
 # KIMI_BASE_URL explicitly.
-KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
-KIMI_CODE_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
-KIMI_CODE_OAUTH_HOST = "https://auth.kimi.com"
+#
+# Note: the base URL intentionally has NO /v1 suffix.  The /coding endpoint
+# speaks the Anthropic Messages protocol, and the anthropic SDK appends
+# "/v1/messages" internally — so "/coding" + SDK suffix → "/coding/v1/messages"
+# (the correct target). Using "/coding/v1" here would produce
+# "/coding/v1/v1/messages" (a 404).
+KIMI_CODE_BASE_URL = "https://api.kimi.com/coding"
 
 
 def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) -> str:
@@ -506,7 +510,11 @@ def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) ->
 # Kimi CLI OAuth (read credentials installed by `kimi login`)
 # =============================================================================
 
-def _kimi_cli_credentials_path():
+KIMI_CODE_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+KIMI_CODE_OAUTH_HOST = "https://auth.kimi.com"
+
+
+def _kimi_cli_credentials_path() -> Path:
     return Path.home() / ".kimi" / "credentials" / "kimi-code.json"
 
 
@@ -517,10 +525,8 @@ def _kimi_cli_device_id_path() -> Path:
 def _kimi_cli_version() -> str:
     """Return installed kimi-cli version, or a sensible default."""
     try:
-        import shutil
         kimi_bin = shutil.which("kimi")
         if kimi_bin:
-            import subprocess
             result = subprocess.run(
                 [kimi_bin, "--version"],
                 capture_output=True, text=True, timeout=5,
@@ -580,21 +586,6 @@ def _refresh_kimi_cli_credentials(
     """Refresh Kimi CLI OAuth credentials and persist the updated token file."""
     refresh_token = str(tokens.get("refresh_token", "") or "").strip()
     access_token = str(tokens.get("access_token", "") or "").strip()
-    if not refresh_token:
-        if access_token and not force_refresh and not _kimi_oauth_token_is_expired(tokens.get("expires_at")):
-            return {
-                "provider": "kimi-coding",
-                "api_key": access_token,
-                "base_url": base_url,
-                "source": "kimi-cli-oauth",
-                "auth_file": str(_kimi_cli_credentials_path()),
-            }
-        raise AuthError(
-            "Kimi CLI OAuth credentials are missing a refresh_token. Run `kimi login` to re-authenticate.",
-            provider="kimi-coding",
-            code="kimi_oauth_missing_refresh_token",
-            relogin_required=True,
-        )
 
     if access_token and not force_refresh and not _kimi_oauth_token_is_expired(tokens.get("expires_at")):
         return {
@@ -604,6 +595,14 @@ def _refresh_kimi_cli_credentials(
             "source": "kimi-cli-oauth",
             "auth_file": str(_kimi_cli_credentials_path()),
         }
+
+    if not refresh_token:
+        raise AuthError(
+            "Kimi CLI OAuth credentials are missing a refresh_token. Run `kimi login` to re-authenticate.",
+            provider="kimi-coding",
+            code="kimi_oauth_missing_refresh_token",
+            relogin_required=True,
+        )
 
     timeout = httpx.Timeout(max(5.0, float(timeout_seconds)))
     with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}) as client:
@@ -713,8 +712,8 @@ def _kimi_oauth_token_is_expired(expires_at: Any, skew_seconds: int = 300) -> bo
 
 def kimi_coding_default_headers() -> Dict[str, str]:
     """Return the X-Msh-* headers that Kimi's coding API now requires."""
-    import platform
-    import socket
+    import platform as _platform
+    import socket as _socket
 
     device_id = ""
     device_path = _kimi_cli_device_id_path()
@@ -730,9 +729,9 @@ def kimi_coding_default_headers() -> Dict[str, str]:
         "User-Agent": f"KimiCLI/{version}",
         "X-Msh-Platform": "kimi_cli",
         "X-Msh-Version": version,
-        "X-Msh-Device-Name": platform.node() or socket.gethostname(),
-        "X-Msh-Device-Model": platform.machine(),
-        "X-Msh-Os-Version": platform.version(),
+        "X-Msh-Device-Name": _platform.node() or _socket.gethostname(),
+        "X-Msh-Device-Model": _platform.machine(),
+        "X-Msh-Os-Version": _platform.version(),
     }
     if device_id:
         headers["X-Msh-Device-Id"] = device_id
@@ -810,14 +809,13 @@ def resolve_kimi_coding_runtime_credentials(
             "provider": "kimi-coding",
             "api_key": api_key,
             "base_url": base_url,
-            "source": "env",
+            "source": "env-api-key",
         }
 
     raise AuthError(
-        "No Kimi credentials found. Either run 'kimi login' (OAuth) or "
-        "set the KIMI_API_KEY environment variable.",
+        "No Kimi credentials found. Set KIMI_API_KEY or run 'kimi login'.",
         provider="kimi-coding",
-        code="kimi_no_credentials",
+        code="kimi_auth_missing",
     )
 
 
@@ -1764,7 +1762,7 @@ def resolve_provider(
         # whose availability isn't implied by LM_API_KEY presence (it may be
         # offline, and the no-auth setup uses a placeholder value), so it
         # also requires explicit selection.
-        if pid in ("copilot", "lmstudio"):
+        if pid in {"copilot", "lmstudio"}:
             continue
         for env_var in pconfig.api_key_env_vars:
             if has_usable_secret(os.getenv(env_var, "")):
@@ -2855,7 +2853,7 @@ def refresh_codex_oauth_pure(
         # A 401/403 from the token endpoint always means the refresh token
         # is invalid/expired — force relogin even if the body error code
         # wasn't one of the known strings above.
-        if response.status_code in (401, 403) and not relogin_required:
+        if response.status_code in {401, 403} and not relogin_required:
             relogin_required = True
         raise AuthError(
             message,
@@ -3261,7 +3259,7 @@ def _merge_shared_nous_oauth_state(state: Dict[str, Any]) -> bool:
         "expires_at",
     ):
         value = shared.get(key)
-        if value not in (None, ""):
+        if value not in {None, ""}:
             state[key] = value
     return True
 
@@ -4300,7 +4298,7 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
 
-    if provider_id in ("kimi-coding", "kimi-coding-cn"):
+    if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
     elif env_url:
         base_url = env_url
@@ -4360,6 +4358,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "google-gemini-cli":
         return get_gemini_oauth_auth_status()
+    if target == "minimax-oauth":
+        return get_minimax_oauth_auth_status()
     if target == "copilot-acp":
         return get_external_process_provider_status(target)
     # API-key providers
@@ -4404,22 +4404,8 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
 
-    if provider_id in ("kimi-coding", "kimi-coding-cn"):
+    if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
-        # Prefer the Kimi CLI OAuth session only when no explicit KIMI_API_KEY
-        # (or stored API key) is available. Explicit API keys must remain
-        # deterministic for tests and for users who intentionally choose them.
-        if not api_key and ("api.kimi.com" in base_url or not env_url):
-            try:
-                oauth_creds = resolve_kimi_coding_runtime_credentials()
-                return {
-                    "provider": provider_id,
-                    "api_key": oauth_creds["api_key"],
-                    "base_url": str(oauth_creds.get("base_url") or base_url).rstrip("/"),
-                    "source": oauth_creds.get("source", "kimi-cli-oauth"),
-                }
-            except AuthError:
-                logger.debug("Kimi CLI OAuth unavailable, using API key fallback.")
     elif provider_id == "zai":
         base_url = _resolve_zai_base_url(api_key, pconfig.inference_base_url, env_url)
     elif env_url:
@@ -4838,7 +4824,7 @@ def _login_openai_codex(
                     reuse = input("Use existing credentials? [Y/n]: ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     reuse = "y"
-                if reuse in ("", "y", "yes"):
+                if reuse in {"", "y", "yes"}:
                     config_path = _update_config_for_provider("openai-codex", existing.get("base_url", DEFAULT_CODEX_BASE_URL))
                     print()
                     print("Login successful!")
@@ -4859,7 +4845,7 @@ def _login_openai_codex(
                 do_import = input("Import these credentials? (a separate login is recommended) [y/N]: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 do_import = "n"
-            if do_import in ("y", "yes"):
+            if do_import in {"y", "yes"}:
                 _save_codex_tokens(cli_tokens)
                 base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
                 config_path = _update_config_for_provider("openai-codex", base_url)
@@ -4951,7 +4937,7 @@ def _codex_device_code_login() -> Dict[str, Any]:
                 if poll_resp.status_code == 200:
                     code_resp = poll_resp.json()
                     break
-                elif poll_resp.status_code in (403, 404):
+                elif poll_resp.status_code in {403, 404}:
                     continue  # User hasn't completed login yet
                 else:
                     raise AuthError(
@@ -5085,6 +5071,20 @@ def _minimax_request_user_code(
     return payload
 
 
+def _minimax_expired_in_looks_like_unix_ms(expired_in: int, *, now_ms: int) -> bool:
+    """True if ``expired_in`` is plausibly a unix-ms absolute time (vs TTL seconds)."""
+    return int(expired_in) > (now_ms // 2)
+
+
+def _minimax_resolve_token_expiry_unix(expired_in: int, *, now: datetime) -> float:
+    """Return access-token expiry as unix seconds (MiniMax uses ms epoch or TTL seconds)."""
+    raw = int(expired_in)
+    now_ms = int(now.timestamp() * 1000)
+    if _minimax_expired_in_looks_like_unix_ms(raw, now_ms=now_ms):
+        return raw / 1000.0
+    return now.timestamp() + max(1, raw)
+
+
 def _minimax_poll_token(
     client: httpx.Client, *, portal_base_url: str, client_id: str,
     user_code: str, code_verifier: str, expired_in: int, interval_ms: Optional[int],
@@ -5093,12 +5093,11 @@ def _minimax_poll_token(
     # Defensive parsing: if it's small enough to be a duration, treat as seconds.
     import time as _time
     now_ms = int(_time.time() * 1000)
-    if expired_in > now_ms // 2:
-        # Looks like a unix-ms timestamp.
-        deadline = expired_in / 1000.0
+    raw = int(expired_in)
+    if _minimax_expired_in_looks_like_unix_ms(raw, now_ms=now_ms):
+        deadline = raw / 1000.0
     else:
-        # Treat as duration in seconds from now.
-        deadline = _time.time() + max(1, expired_in)
+        deadline = _time.time() + max(1, raw)
     interval = max(2.0, (interval_ms or 2000) / 1000.0)
 
     while _time.time() < deadline:
@@ -5212,8 +5211,10 @@ def _minimax_oauth_login(
         )
 
     now = datetime.now(timezone.utc)
-    expires_in_s = int(token_data["expired_in"])
-    expires_at = now.timestamp() + expires_in_s
+    expires_at_unix = _minimax_resolve_token_expiry_unix(
+        int(token_data["expired_in"]), now=now,
+    )
+    expires_in_s = max(0, int(expires_at_unix - now.timestamp()))
 
     auth_state = {
         "provider": "minimax-oauth",
@@ -5227,7 +5228,7 @@ def _minimax_oauth_login(
         "refresh_token": token_data["refresh_token"],
         "resource_url": token_data.get("resource_url"),
         "obtained_at": now.isoformat(),
-        "expires_at": datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat(),
+        "expires_at": datetime.fromtimestamp(expires_at_unix, tz=timezone.utc).isoformat(),
         "expires_in": expires_in_s,
     }
 
@@ -5288,14 +5289,16 @@ def _refresh_minimax_oauth_state(
             relogin_required=True,
         )
     now_dt = datetime.now(timezone.utc)
-    expires_in_s = int(payload["expired_in"])
+    expires_at_unix = _minimax_resolve_token_expiry_unix(
+        int(payload["expired_in"]), now=now_dt,
+    )
+    expires_in_s = max(0, int(expires_at_unix - now_dt.timestamp()))
     new_state = dict(state)
     new_state.update({
         "access_token": payload["access_token"],
         "refresh_token": payload.get("refresh_token", state["refresh_token"]),
         "obtained_at": now_dt.isoformat(),
-        "expires_at": datetime.fromtimestamp(now_dt.timestamp() + expires_in_s,
-                                             tz=timezone.utc).isoformat(),
+        "expires_at": datetime.fromtimestamp(expires_at_unix, tz=timezone.utc).isoformat(),
         "expires_in": expires_in_s,
     })
     _minimax_save_auth_state(new_state)
@@ -5516,7 +5519,7 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
                 do_import = input("Import these credentials? [Y/n]: ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 do_import = "y"
-            if do_import in ("", "y", "yes"):
+            if do_import in {"", "y", "yes"}:
                 print("Rehydrating Nous session from shared credentials...")
                 auth_state = _try_import_shared_nous_state(
                     timeout_seconds=timeout_seconds,
@@ -5579,6 +5582,8 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
             from hermes_cli.models import (
                 get_curated_nous_model_ids, get_pricing_for_provider,
                 check_nous_free_tier, partition_nous_models_by_tier,
+                union_with_portal_free_recommendations,
+                union_with_portal_paid_recommendations,
             )
             model_ids = get_curated_nous_model_ids()
 
@@ -5587,9 +5592,26 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
             if model_ids:
                 pricing = get_pricing_for_provider("nous")
                 free_tier = check_nous_free_tier()
+                _portal_for_recs = auth_state.get("portal_base_url", "")
                 if free_tier:
+                    # The Portal's freeRecommendedModels endpoint is the
+                    # source of truth for what's free *right now*. Augment
+                    # the curated list with anything new the Portal flags
+                    # as free so users on older Hermes builds still see
+                    # newly-launched free models without a CLI release.
+                    model_ids, pricing = union_with_portal_free_recommendations(
+                        model_ids, pricing, _portal_for_recs,
+                    )
                     model_ids, unavailable_models = partition_nous_models_by_tier(
                         model_ids, pricing, free_tier=True,
+                    )
+                else:
+                    # Paid-tier mirror: pull paidRecommendedModels so newly
+                    # launched paid models surface in the picker even if
+                    # the in-repo curated list and docs-hosted manifest
+                    # haven't caught up yet.
+                    model_ids, pricing = union_with_portal_paid_recommendations(
+                        model_ids, pricing, _portal_for_recs,
                     )
             _portal = auth_state.get("portal_base_url", "")
             if model_ids:
