@@ -4401,6 +4401,37 @@ class AIAgent:
             if isinstance(msg, dict) and msg.get("role") == "user":
                 msg["content"] = override
 
+    def _sanitize_unanswered_tool_calls(self, messages: List[Dict], error_msg: str = "Agent interrupted by user") -> None:
+        """Append synthetic error results for any unanswered tool_calls.
+
+        OpenAI/Anthropic require a `role="tool"` message for every
+        `tool_call_id` emitted by the assistant. If an interrupt or error
+        fires before all tools finish, this prevents the next API call from
+        failing with a "missing tool response" error.
+        """
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if not isinstance(msg, dict):
+                break
+            if msg.get("role") == "tool":
+                continue
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                answered_ids = {
+                    m["tool_call_id"]
+                    for m in messages[idx + 1:]
+                    if isinstance(m, dict) and m.get("role") == "tool"
+                }
+                for tc in msg["tool_calls"]:
+                    if not tc or not isinstance(tc, dict):
+                        continue
+                    if tc["id"] not in answered_ids:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": f"Error executing tool: {error_msg}",
+                        })
+                break
+
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
 
@@ -4408,6 +4439,8 @@ class AIAgent:
         """
         self._drop_trailing_empty_response_scaffolding(messages)
         self._apply_persist_user_message_override(messages)
+        # Guarantee API-valid transcript: every tool_call must have a matching tool result.
+        self._sanitize_unanswered_tool_calls(messages)
         self._session_messages = messages
         self._save_session_log(messages)
         self._flush_messages_to_session_db(messages, conversation_history)

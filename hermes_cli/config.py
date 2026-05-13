@@ -911,6 +911,7 @@ DEFAULT_CONFIG = {
         # Mirrors `hermes -c` muscle memory.  Default off so existing
         # users aren't surprised.  HERMES_TUI_RESUME=<id> always wins.
         "tui_auto_resume_recent": False,
+        "ctrl_c_priority": "interrupt_agent",  # "interrupt_agent" | "clear_input"
         "bell_on_complete": False,
         "show_reasoning": False,
         "streaming": False,
