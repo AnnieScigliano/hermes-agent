@@ -2622,7 +2622,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
             is_agent_turn=True, is_vision=is_vision
         )
     elif base_url_host_matches(sync_base_url, "api.kimi.com"):
-        async_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+        from hermes_cli.auth import kimi_coding_default_headers
+        async_kwargs["default_headers"] = kimi_coding_default_headers()
     else:
         # Fall back to profile.default_headers for providers that declare
         # client-level headers on their ProviderProfile (e.g. attribution
