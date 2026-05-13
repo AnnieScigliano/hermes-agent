@@ -14,6 +14,7 @@ const buildUiState = (): UiState => ({
   detailsMode: 'collapsed',
   detailsModeCommandOverride: false,
   indicatorStyle: DEFAULT_INDICATOR_STYLE,
+  historyNavRequiresEmptyInput: false,
   info: null,
   inlineDiffs: true,
   mouseTracking: MOUSE_TRACKING,
