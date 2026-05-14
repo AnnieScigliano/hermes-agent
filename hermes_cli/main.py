@@ -4325,6 +4325,8 @@ def _model_flow_kimi(config, current_model=""):
         _prompt_model_selection,
         _save_model_choice,
         deactivate_provider,
+        resolve_kimi_coding_runtime_credentials,
+        AuthError,
     )
     from hermes_cli.config import (
         get_env_value,
@@ -4338,21 +4340,48 @@ def _model_flow_kimi(config, current_model=""):
     key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
     base_url_env = pconfig.base_url_env_var or ""
 
-    # Step 1: Check / prompt for API key
+    # Step 1: Check for credentials — prefer OAuth, then env API key, then prompt
     existing_key = ""
     for ev in pconfig.api_key_env_vars:
         existing_key = get_env_value(ev) or os.getenv(ev, "")
         if existing_key:
             break
 
-    existing_key, abort = _prompt_api_key(
-        pconfig, existing_key, provider_id=provider_id
-    )
-    if abort:
-        return
+    oauth_available = False
+    if not existing_key:
+        try:
+            oauth_creds = resolve_kimi_coding_runtime_credentials()
+            if oauth_creds.get("source") in {"kimi-cli-oauth", "kimi-cli-oauth-refresh"}:
+                oauth_available = True
+                print(f"  {pconfig.name} OAuth: {oauth_creds['auth_file']} ✓")
+                print()
+        except AuthError:
+            pass
 
-    # Step 2: Auto-detect endpoint from key prefix
-    is_coding_plan = existing_key.startswith("sk-kimi-")
+    if not existing_key and not oauth_available:
+        print(f"No {pconfig.name} API key configured.")
+        if key_env:
+            try:
+                import getpass
+
+                new_key = getpass.getpass(f"{key_env} (or Enter to cancel): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                return
+            if not new_key:
+                print("Cancelled.")
+                return
+            save_env_value(key_env, new_key)
+            existing_key = new_key
+            print("API key saved.")
+            print()
+    elif existing_key:
+        print(f"  {pconfig.name} API key: {existing_key[:8]}... ✓")
+        print()
+
+
+    # Step 2: Auto-detect endpoint from key prefix or OAuth
+    is_coding_plan = oauth_available or existing_key.startswith("sk-kimi-")
     if is_coding_plan:
         effective_base = KIMI_CODE_BASE_URL
         print(f"  Detected Kimi Coding Plan key → {effective_base}")
@@ -4366,11 +4395,11 @@ def _model_flow_kimi(config, current_model=""):
 
     # Step 3: Model selection — show appropriate models for the endpoint
     if is_coding_plan:
-        # Coding Plan models (kimi-k2.6 first)
+        # Coding Plan models
         model_list = [
             "kimi-k2.6",
-            "kimi-k2.5",
             "kimi-for-coding",
+            "kimi-k2.5",
             "kimi-k2-thinking",
             "kimi-k2-thinking-turbo",
         ]
@@ -8823,6 +8852,22 @@ def cmd_profile(args):
             print(f"Error: {e}")
             sys.exit(1)
 
+    elif action == "setup":
+        name = args.profile_name
+        template = getattr(args, "template", None) or name
+        if template == "researcher":
+            from hermes_cli.researcher_scaffold import setup_researcher_profile
+            try:
+                print(f"\nSetting up '{name}' profile with researcher scaffold...")
+                setup_researcher_profile(name)
+            except FileNotFoundError as e:
+                print(f"Error: {e}")
+                sys.exit(1)
+        else:
+            print(f"No scaffold template available for '{template}'.")
+            print("Available templates: researcher")
+            sys.exit(1)
+
     elif action == "delete":
         name = args.profile_name
         yes = getattr(args, "yes", False)
@@ -11608,6 +11653,16 @@ Examples:
         "--no-skills",
         action="store_true",
         help="Create an empty profile with no bundled skills (opts out of `hermes update` skill sync)",
+    )
+
+    profile_setup = profile_subparsers.add_parser(
+        "setup", help="Apply a scaffold template to an existing profile"
+    )
+    profile_setup.add_argument("profile_name", help="Profile to configure")
+    profile_setup.add_argument(
+        "--template",
+        metavar="TEMPLATE",
+        help="Scaffold template to apply (default: profile name). Available: researcher",
     )
 
     profile_delete = profile_subparsers.add_parser("delete", help="Delete a profile")

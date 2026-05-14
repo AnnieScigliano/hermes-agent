@@ -23,6 +23,7 @@ from hermes_cli.auth import (
     resolve_codex_runtime_credentials,
     resolve_qwen_runtime_credentials,
     resolve_gemini_oauth_runtime_credentials,
+    resolve_kimi_coding_runtime_credentials,
     resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,
     has_usable_secret,
@@ -64,14 +65,10 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
 
     - Direct api.openai.com endpoints need the Responses API for GPT-5.x
       tool calls with reasoning (chat/completions returns 400).
-    - Third-party Anthropic-compatible gateways (MiniMax, Zhipu GLM,
-      LiteLLM proxies, etc.) conventionally expose the native Anthropic
-      protocol under a ``/anthropic`` suffix — treat those as
-      ``anthropic_messages`` transport instead of the default
-      ``chat_completions``.
-    - Kimi Code's ``api.kimi.com/coding`` endpoint also speaks the
-      Anthropic Messages protocol (the /coding route accepts Claude
-      Code's native request shape).
+    - Third-party Anthropic-compatible gateways (MiniMax, LiteLLM proxies,
+      etc.) conventionally expose the native Anthropic protocol under a
+      ``/anthropic`` suffix — treat those as ``anthropic_messages``
+      transport instead of the default ``chat_completions``.
     """
     normalized = (base_url or "").strip().lower().rstrip("/")
     hostname = base_url_hostname(base_url)
@@ -80,8 +77,6 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     if hostname == "api.openai.com":
         return "codex_responses"
     if normalized.endswith("/anthropic"):
-        return "anthropic_messages"
-    if hostname == "api.kimi.com" and "/coding" in normalized:
         return "anthropic_messages"
     return None
 
@@ -1335,15 +1330,24 @@ def resolve_runtime_provider(
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
-        creds = resolve_api_key_provider_credentials(provider)
-        # Honour model.base_url from config.yaml when the configured provider
-        # matches this provider — mirrors the Anthropic path above.  Without
-        # this, users who set model.base_url to e.g. api.minimaxi.com/anthropic
-        # (China endpoint) still get the hardcoded api.minimax.io default (#6039).
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = ""
         if cfg_provider == provider:
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
+        creds = resolve_api_key_provider_credentials(provider)
+        if (
+            provider in ("kimi-coding", "kimi-coding-cn")
+            and not str(creds.get("api_key", "")).strip()
+            and "api.kimi.com" in cfg_base_url
+        ):
+            try:
+                creds = resolve_kimi_coding_runtime_credentials()
+            except AuthError:
+                pass
+        # Honour model.base_url from config.yaml when the configured provider
+        # matches this provider — mirrors the Anthropic path above.  Without
+        # this, users who set model.base_url to e.g. api.minimaxi.com/anthropic
+        # (China endpoint) still get the hardcoded api.minimax.io default (#6039).
         base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
         api_mode = "chat_completions"
         if provider == "copilot":

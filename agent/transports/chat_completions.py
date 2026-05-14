@@ -10,7 +10,10 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import copy
+import logging
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
@@ -387,6 +390,39 @@ class ChatCompletionsTransport(ProviderTransport):
         overrides = params.get("request_overrides")
         if overrides:
             api_kwargs.update(overrides)
+
+        # Tool choice override for proactive/agentic turns
+        _tool_choice = params.get("tool_choice")
+        if _tool_choice:
+            # Kimi: tool_choice='required' is rejected when thinking is enabled.
+            # Fall back to letting the model decide — the system prompt still
+            # instructs it to use tools.
+            if is_kimi and _tool_choice == "required" and not _kimi_thinking_off:
+                logger.warning(
+                    "[chat_completions] Skipping tool_choice='required' for Kimi "
+                    "because thinking is enabled (incompatible)."
+                )
+            else:
+                # Generic: disable thinking/reasoning for this turn when forcing
+                # tool_choice="required", since several providers reject the
+                # combination.  Kimi is handled above (it cannot disable thinking).
+                if _tool_choice == "required":
+                    _stripped_any = False
+                    if "reasoning_effort" in api_kwargs:
+                        api_kwargs.pop("reasoning_effort")
+                        _stripped_any = True
+                    if "extra_body" in api_kwargs:
+                        _eb = api_kwargs["extra_body"]
+                        if isinstance(_eb, dict) and "thinking_config" in _eb:
+                            _eb.pop("thinking_config")
+                            _stripped_any = True
+                        if isinstance(_eb, dict) and not _eb:
+                            api_kwargs.pop("extra_body")
+                    if _stripped_any:
+                        logger.info(
+                            "[chat_completions] Disabled thinking for tool_choice='required' turn."
+                        )
+                api_kwargs["tool_choice"] = _tool_choice
 
         return api_kwargs
 
