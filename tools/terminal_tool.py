@@ -1901,6 +1901,8 @@ def terminal_tool(
 
             session_key = get_current_session_key(default="")
             effective_cwd = workdir or cwd
+            if effective_cwd:
+                effective_cwd = os.path.expandvars(os.path.expanduser(effective_cwd))
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -2271,7 +2273,7 @@ if __name__ == "__main__":
     print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', os.getcwd())}")
     from hermes_constants import display_hermes_home as _dhh
     print(f"  TERMINAL_SANDBOX_DIR: {os.getenv('TERMINAL_SANDBOX_DIR', f'{_dhh()}/sandboxes')}")
-    print(f"  TERMINAL_TIMEOUT: {os.getenv('TERMINAL_TIMEOUT', '60')}")
+    print(f"  TERMINAL_TIMEOUT: {os.getenv('TERMINAL_TIMEOUT', '180')}")
     print(f"  TERMINAL_LIFETIME_SECONDS: {os.getenv('TERMINAL_LIFETIME_SECONDS', '300')}")
 
 
