@@ -2128,6 +2128,7 @@ class AIAgent:
             pass
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
+        compression_protect_first = int(_compression_cfg.get("protect_first_n", 3))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
         # protect_first_n is the number of non-system messages to protect at
         # the head, in addition to the system prompt (which is always
@@ -2138,6 +2139,18 @@ class AIAgent:
         compression_protect_first = max(
             0, int(_compression_cfg.get("protect_first_n", 3))
         )
+
+        # Optional custom compression prompt overrides
+        _prompt_cfg = _compression_cfg.get("prompt", {})
+        if not isinstance(_prompt_cfg, dict):
+            _prompt_cfg = {}
+        compression_summary_preamble = _prompt_cfg.get("preamble") or None
+        compression_summary_template = _prompt_cfg.get("template") or None
+        # Strip whitespace so empty strings in YAML are treated as "not set"
+        if compression_summary_preamble and not compression_summary_preamble.strip():
+            compression_summary_preamble = None
+        if compression_summary_template and not compression_summary_template.strip():
+            compression_summary_template = None
 
         # Read optional explicit context_length override for the auxiliary
         # compression model. Custom endpoints often cannot report this via
@@ -2352,6 +2365,8 @@ class AIAgent:
                 config_context_length=_config_context_length,
                 provider=self.provider,
                 api_mode=self.api_mode,
+                summary_preamble=compression_summary_preamble,
+                summary_template=compression_summary_template,
             )
         self.compression_enabled = compression_enabled
 
@@ -3506,11 +3521,13 @@ class AIAgent:
             OpenAI-wire proxies expect the looser layout).
 
         Third-party providers using the native Anthropic transport
-        (``api_mode == 'anthropic_messages'`` + Claude-named model) get
-        caching with the native layout so they benefit from the same
-        cost reduction as direct Anthropic callers, provided their
-        gateway implements the Anthropic cache_control contract
-        (MiniMax, Zhipu GLM, LiteLLM's Anthropic proxy mode all do).
+        (``api_mode == 'anthropic_messages'``) get caching with the
+        native layout when the model is Claude-named or the provider
+        is a known Anthropic-compatible gateway that documents
+        ``cache_control`` support for its own models (MiniMax).
+        LiteLLM proxies and Zhipu GLM also implement the contract
+        but are only enabled for Claude-named models until they
+        document cache support for their own model families.
 
         Qwen / Alibaba-family models on OpenCode, OpenCode Go, and direct
         Alibaba (DashScope) also honour Anthropic-style ``cache_control``
@@ -4504,6 +4521,37 @@ class AIAgent:
             if isinstance(msg, dict) and msg.get("role") == "user":
                 msg["content"] = override
 
+    def _sanitize_unanswered_tool_calls(self, messages: List[Dict], error_msg: str = "Agent interrupted by user") -> None:
+        """Append synthetic error results for any unanswered tool_calls.
+
+        OpenAI/Anthropic require a `role="tool"` message for every
+        `tool_call_id` emitted by the assistant. If an interrupt or error
+        fires before all tools finish, this prevents the next API call from
+        failing with a "missing tool response" error.
+        """
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if not isinstance(msg, dict):
+                break
+            if msg.get("role") == "tool":
+                continue
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                answered_ids = {
+                    m["tool_call_id"]
+                    for m in messages[idx + 1:]
+                    if isinstance(m, dict) and m.get("role") == "tool"
+                }
+                for tc in msg["tool_calls"]:
+                    if not tc or not isinstance(tc, dict):
+                        continue
+                    if tc["id"] not in answered_ids:
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": f"Error executing tool: {error_msg}",
+                        })
+                break
+
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
 
@@ -4511,6 +4559,8 @@ class AIAgent:
         """
         self._drop_trailing_empty_response_scaffolding(messages)
         self._apply_persist_user_message_override(messages)
+        # Guarantee API-valid transcript: every tool_call must have a matching tool result.
+        self._sanitize_unanswered_tool_calls(messages)
         self._session_messages = messages
         self._save_session_log(messages)
         self._flush_messages_to_session_db(messages, conversation_history)
@@ -6509,6 +6559,10 @@ class AIAgent:
         if self._memory_store:
             self._memory_store.load_from_disk()
 
+    def _responses_tools(self, tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
+        """Convert chat-completions tool schemas to Responses function-tool schemas."""
+        return _codex_responses_tools(tools if tools is not None else self.tools)
+
     @staticmethod
     def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
         """Generate a deterministic call_id from tool call content.
@@ -6531,6 +6585,33 @@ class AIAgent:
     ) -> str:
         """Build a valid Responses `function_call.id` (must start with `fc_`)."""
         return _codex_derive_responses_function_call_id(call_id, response_item_id)
+
+    def _chat_messages_to_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert internal chat-style messages to Responses input items."""
+        return _codex_chat_messages_to_responses_input(messages)
+
+    def _preflight_codex_input_items(self, raw_items: Any) -> List[Dict[str, Any]]:
+        return _codex_preflight_codex_input_items(raw_items)
+
+    def _preflight_codex_api_kwargs(
+        self,
+        api_kwargs: Any,
+        *,
+        allow_stream: bool = False,
+    ) -> Dict[str, Any]:
+        return _codex_preflight_codex_api_kwargs(api_kwargs, allow_stream=allow_stream)
+
+    def _extract_responses_message_text(self, item: Any) -> str:
+        """Extract assistant text from a Responses message output item."""
+        return _codex_extract_responses_message_text(item)
+
+    def _extract_responses_reasoning_text(self, item: Any) -> str:
+        """Extract a compact reasoning text from a Responses reasoning item."""
+        return _codex_extract_responses_reasoning_text(item)
+
+    def _normalize_codex_response(self, response: Any) -> tuple[Any, str]:
+        """Normalize a Responses API object to an assistant_message-like object."""
+        return _codex_normalize_codex_response(response)
 
     def _thread_identity(self) -> str:
         thread = threading.current_thread()
@@ -7247,6 +7328,41 @@ class AIAgent:
             return False
 
         logger.info("Copilot credentials refreshed from %s", token_source)
+
+    def _try_refresh_kimi_client_credentials(self, *, force: bool = True) -> bool:
+        if self.provider not in {"kimi-coding", "kimi-coding-cn"} and not base_url_host_matches(self.base_url, "api.kimi.com"):
+            return False
+
+        try:
+            from hermes_cli.auth import resolve_kimi_coding_runtime_credentials, kimi_coding_default_headers
+
+            creds = resolve_kimi_coding_runtime_credentials(
+                force_refresh=force,
+                allow_api_key_fallback=False,
+            )
+        except Exception as exc:
+            logger.debug("Kimi credential refresh failed: %s", exc)
+            return False
+
+        api_key = creds.get("api_key")
+        base_url = creds.get("base_url")
+        source = str(creds.get("source") or "")
+        if source not in {"kimi-cli-oauth", "kimi-cli-oauth-refresh"}:
+            return False
+        if not isinstance(api_key, str) or not api_key.strip():
+            return False
+        if not isinstance(base_url, str) or not base_url.strip():
+            return False
+
+        self.api_key = api_key.strip()
+        self.base_url = base_url.strip().rstrip("/")
+        self._client_kwargs["api_key"] = self.api_key
+        self._client_kwargs["base_url"] = self.base_url
+        self._client_kwargs["default_headers"] = kimi_coding_default_headers()
+
+        if not self._replace_primary_openai_client(reason="kimi_credential_refresh"):
+            return False
+        return True
 
     def _try_refresh_kimi_client_credentials(self, *, force: bool = True) -> bool:
         if self.provider not in {"kimi-coding", "kimi-coding-cn"} and not base_url_host_matches(self.base_url, "api.kimi.com"):
@@ -10741,6 +10857,7 @@ class AIAgent:
                 session_id=self.session_id or "",
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
+                parent_agent=self,
             )
 
     @staticmethod
@@ -11132,7 +11249,9 @@ class AIAgent:
                 env=get_active_env(effective_task_id),
             ) if not _is_multimodal_tool_result(function_result) else function_result
 
-            subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
+            subdir_hints = None
+            if self._subdirectory_hints:
+                subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
             if subdir_hints:
                 if _is_multimodal_tool_result(function_result):
                     # Append the hint to the text summary part so the model
@@ -11462,6 +11581,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        parent_agent=self,
                     )
                     _spinner_result = function_result
                 except Exception as tool_error:
@@ -11482,6 +11602,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        parent_agent=self,
                     )
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -11559,12 +11680,13 @@ class AIAgent:
             ) if not _is_multimodal_tool_result(function_result) else function_result
 
             # Discover subdirectory context files from tool arguments
-            subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
-            if subdir_hints:
-                if _is_multimodal_tool_result(function_result):
-                    _append_subdir_hint_to_multimodal(function_result, subdir_hints)
-                else:
-                    function_result += subdir_hints
+            if self._subdirectory_hints:
+                subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
+                if subdir_hints:
+                    if _is_multimodal_tool_result(function_result):
+                        _append_subdir_hint_to_multimodal(function_result, subdir_hints)
+                    else:
+                        function_result += subdir_hints
 
             # Unwrap _multimodal dicts to an OpenAI-style content list
             # (see parallel path for rationale). String results pass through.
@@ -12627,6 +12749,7 @@ class AIAgent:
             anthropic_auth_retry_attempted=False
             nous_auth_retry_attempted=False
             copilot_auth_retry_attempted=False
+            kimi_auth_retry_attempted=False
             thinking_sig_retry_attempted = False
             image_shrink_retry_attempted = False
             oauth_1m_beta_retry_attempted = False
@@ -12694,7 +12817,6 @@ class AIAgent:
                         _sanitize_structure_non_ascii(api_kwargs)
                     if self.api_mode == "codex_responses":
                         api_kwargs = self._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
-
                     try:
                         from hermes_cli.plugins import invoke_hook as _invoke_hook
                         _invoke_hook(
@@ -13759,6 +13881,18 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}🔐 Copilot credentials refreshed after 401. Retrying request...")
                             continue
                     if (
+                        status_code == 401
+                        and not kimi_auth_retry_attempted
+                        and (
+                            self.provider in {"kimi-coding", "kimi-coding-cn"}
+                            or base_url_host_matches(self.base_url, "api.kimi.com")
+                        )
+                    ):
+                        kimi_auth_retry_attempted = True
+                        if self._try_refresh_kimi_client_credentials(force=True):
+                            print(f"{self.log_prefix}🔐 Kimi OAuth refreshed after 401. Retrying request...")
+                            continue
+                    if (
                         self.api_mode == "anthropic_messages"
                         and status_code == 401
                         and hasattr(self, '_anthropic_api_key')
@@ -14565,8 +14699,7 @@ class AIAgent:
                     _normalize_kwargs["strip_tool_prefix"] = self._is_anthropic_oauth
                 normalized = _transport.normalize_response(response, **_normalize_kwargs)
                 assistant_message = normalized
-                finish_reason = normalized.finish_reason
-                
+                finish_reason = normalized.finish_reason                
                 # Normalize content to string — some OpenAI-compatible servers
                 # (llama-server, etc.) return content as a dict or list instead
                 # of a plain string, which crashes downstream .strip() calls.
@@ -14966,7 +15099,19 @@ class AIAgent:
                         except Exception:
                             pass
 
-                    self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    execute_tool_calls = self._execute_tool_calls
+                    try:
+                        import inspect as _inspect
+                        _execute_params = _inspect.signature(execute_tool_calls).parameters
+                        _accepts_api_call_count = len(_execute_params) >= 4 or any(
+                            p.kind == p.VAR_POSITIONAL for p in _execute_params.values()
+                        )
+                    except Exception:
+                        _accepts_api_call_count = True
+                    if _accepts_api_call_count:
+                        execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    else:
+                        execute_tool_calls(assistant_message, messages, effective_task_id)
 
                     if self._tool_guardrail_halt_decision is not None:
                         decision = self._tool_guardrail_halt_decision
@@ -15416,6 +15561,7 @@ class AIAgent:
                                 messages.append(err_msg)
                     break
                 
+
                 # Non-tool errors don't need a synthetic message injected.
                 # The error is already printed to the user (line above), and
                 # the retry loop continues.  Injecting a fake user/assistant

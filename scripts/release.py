@@ -47,6 +47,9 @@ AUTHOR_MAP = {
     "simpolism@gmail.com": "simpolism",
     "jake@nousresearch.com": "simpolism",
     "mgongzai@gmail.com": "vKongv",
+    # Fede654 (Federico Bonino)
+    "buzondefede@gmail.com": "Fede654",
+    "fede@localhost.localdomain": "Fede654",
     "0x.badfriend@gmail.com": "discodirector",
     "altriatree@gmail.com": "TruaShamu",
     "m@mobrienv.dev": "mikeyobrien",
