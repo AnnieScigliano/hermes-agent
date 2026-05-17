@@ -5377,6 +5377,13 @@ class GatewayRunner:
                 return None
             return YuanbaoAdapter(config)
 
+        elif platform == Platform.DAEMONCRAFT:
+            from gateway.platforms.daemoncraft import DaemonCraftAdapter, check_daemoncraft_requirements
+            if not check_daemoncraft_requirements():
+                logger.warning("DaemonCraft: aiohttp not installed")
+                return None
+            return DaemonCraftAdapter(config)
+
         return None
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -5419,6 +5426,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            Platform.DAEMONCRAFT: "DAEMONCRAFT_ALLOWED_USERS",
         }
         platform_group_user_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -5445,6 +5453,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+            Platform.DAEMONCRAFT: "DAEMONCRAFT_ALLOW_ALL_USERS",
         }
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
         platform_allow_bots_map = {
@@ -7525,7 +7534,7 @@ class GatewayRunner:
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK and source.platform != Platform.DAEMONCRAFT:
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             if not os.getenv(env_key):
@@ -7610,6 +7619,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                tool_choice=getattr(event, "tool_choice", None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -14298,6 +14308,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        tool_choice: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -14851,8 +14862,26 @@ class GatewayRunner:
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
 
-            # Read from env var or use default (same as CLI)
-            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            # DC-134: per-profile max_iterations / turn_timeout (DaemonCraft etc.)
+            # Load from active profile config so gateway-wide defaults are not
+            # forced on every platform.
+            _profile_name = getattr(source, "profile", None) or ""
+            _profile_max_turns = None
+            _profile_turn_timeout = None
+            if _profile_name:
+                try:
+                    import yaml as _yaml
+                    _profile_cfg_path = Path.home() / ".hermes" / "profiles" / _profile_name / "config.yaml"
+                    if _profile_cfg_path.exists():
+                        _profile_cfg = _yaml.safe_load(_profile_cfg_path.read_text()) or {}
+                        _agent_cfg = _profile_cfg.get("agent", {})
+                        _profile_max_turns = _agent_cfg.get("max_turns")
+                        _profile_turn_timeout = _agent_cfg.get("turn_timeout_seconds")
+                except Exception:
+                    pass
+
+            max_iterations = int(_profile_max_turns or os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            turn_timeout_seconds = int(_profile_turn_timeout or os.getenv("HERMES_TURN_TIMEOUT_SECONDS", "0") or 0) or None
             
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
@@ -15038,6 +15067,7 @@ class GatewayRunner:
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
+                    turn_timeout_seconds=turn_timeout_seconds,
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
@@ -15073,6 +15103,11 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
+            # If a profile is active, override the cached system prompt so the
+            # agent does not load the global SOUL.md from SQLite session storage.
+            _profile_name = getattr(source, "profile", None)
+            if _profile_name and combined_ephemeral:
+                agent._cached_system_prompt = combined_ephemeral
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
@@ -15473,7 +15508,12 @@ class GatewayRunner:
                 else:
                     _run_message = message
 
-                result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                result = agent.run_conversation(
+                    _run_message,
+                    conversation_history=agent_history,
+                    task_id=session_id,
+                    tool_choice=tool_choice,
+                )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
