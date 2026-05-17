@@ -81,6 +81,12 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
         return "codex_responses"
     if normalized.endswith("/anthropic"):
         return "anthropic_messages"
+    if hostname == "api.kimi.com" and normalized.endswith("/coding/v1"):
+        # Kimi Coding Plan exposes an OpenAI-compatible surface at
+        # /coding/v1/chat/completions. Older fork configs stored this URL
+        # directly; keep routing those sessions through chat_completions so
+        # the OpenAI SDK sends Bearer auth and default_headers are applied.
+        return "chat_completions"
     if hostname == "api.kimi.com" and "/coding" in normalized:
         return "anthropic_messages"
     return None

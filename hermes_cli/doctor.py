@@ -1447,7 +1447,9 @@ def run_doctor(args):
                 "User-Agent": _HERMES_USER_AGENT,
             }
             if base_url_host_matches(base, "api.kimi.com"):
-                headers["User-Agent"] = "claude-code/0.1.0"
+                from hermes_cli.auth import kimi_coding_default_headers
+                headers = kimi_coding_default_headers()
+                headers["Authorization"] = f"Bearer {key}"
             r = httpx.get(url, headers=headers, timeout=10)
             if (
                 pname == "Alibaba/DashScope"
