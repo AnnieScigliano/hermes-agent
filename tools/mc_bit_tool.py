@@ -47,8 +47,8 @@ def _handler(args: dict[str, Any] | None = None, **_kw: Any) -> str:
     if missing:
         return (
             "Error: mc_bit requires x1, y1, z1, x2, y2, z2 "
-            f"(missing: {', '.join(missing)}). Use mc_perceive(type='status') "
-            "to get bot position first."
+            f"(missing: {', '.join(missing)}). "
+            "Provide all 6 coordinates for the scan volume."
         )
 
     fmt = str(args.get("format", "binary"))
@@ -97,11 +97,13 @@ registry.register(
         "function": {
             "name": "mc_bit",
             "description": (
-                "Perceive a 3D chunk of the Minecraft world as text using mBit format. "
+                "Scan a 3D volume of the Minecraft world as raw text using mBit format. "
                 "Returns a spatial text representation of blocks in the given volume. "
-                "Use this INSTEAD of mc_perceive(type='nearby') when you need spatial "
-                "awareness — to understand terrain, find paths, avoid holes, plan builds, "
-                "or verify the bot's surroundings before acting.\n\n"
+                "Use this for spatial awareness — to understand terrain, find paths, "
+                "avoid holes, plan builds, or verify the bot's surroundings before acting.\n\n"
+                "This is a RAW block scanner. For entity detection, inventory, health, "
+                "and high-level perception, use mc_perceive(type='status|nearby|look'). "
+                "For spatial pathfinding specifically, use mc_bit(format='binary').\n\n"
                 "Formats:\n"
                 "- binary: walkable (0) / solid (1) map (best for navigation)\n"
                 "- columns: terrain profile per column\n"
@@ -136,5 +138,5 @@ registry.register(
     },
     handler=_handler,
     emoji="🧊",
-    description="Perceive a 3D Minecraft chunk as text (mBit format)",
+    description="Scan a 3D Minecraft volume as raw text (mBit format)",
 )
