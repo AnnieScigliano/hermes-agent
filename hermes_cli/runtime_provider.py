@@ -23,7 +23,6 @@ from hermes_cli.auth import (
     resolve_codex_runtime_credentials,
     resolve_qwen_runtime_credentials,
     resolve_gemini_oauth_runtime_credentials,
-    resolve_kimi_coding_runtime_credentials,
     resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,
     has_usable_secret,
@@ -65,10 +64,14 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
 
     - Direct api.openai.com endpoints need the Responses API for GPT-5.x
       tool calls with reasoning (chat/completions returns 400).
-    - Third-party Anthropic-compatible gateways (MiniMax, LiteLLM proxies,
-      etc.) conventionally expose the native Anthropic protocol under a
-      ``/anthropic`` suffix — treat those as ``anthropic_messages``
-      transport instead of the default ``chat_completions``.
+    - Third-party Anthropic-compatible gateways (MiniMax, Zhipu GLM,
+      LiteLLM proxies, etc.) conventionally expose the native Anthropic
+      protocol under a ``/anthropic`` suffix — treat those as
+      ``anthropic_messages`` transport instead of the default
+      ``chat_completions``.
+    - Kimi Code's ``api.kimi.com/coding`` endpoint also speaks the
+      Anthropic Messages protocol (the /coding route accepts Claude
+      Code's native request shape).
     """
     normalized = (base_url or "").strip().lower().rstrip("/")
     hostname = base_url_hostname(base_url)
@@ -87,21 +90,6 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     if hostname == "api.kimi.com" and "/coding" in normalized:
         return "anthropic_messages"
     return None
-
-
-def _try_kimi_oauth_credentials() -> Optional[Dict[str, Any]]:
-    """Return Kimi CLI OAuth credentials when available, otherwise None."""
-    try:
-        from hermes_cli.auth import resolve_kimi_coding_runtime_credentials
-
-        creds = resolve_kimi_coding_runtime_credentials()
-    except Exception:
-        return None
-    if not isinstance(creds, dict):
-        return None
-    if not str(creds.get("api_key") or "").strip():
-        return None
-    return creds
 
 
 def _auto_detect_local_model(base_url: str) -> str:
@@ -182,7 +170,18 @@ def _copilot_runtime_api_mode(model_cfg: Dict[str, Any], api_key: str) -> str:
         return "chat_completions"
 
 
-_VALID_API_MODES = {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}
+_VALID_API_MODES = {
+    "chat_completions",
+    "codex_responses",
+    "anthropic_messages",
+    "bedrock_converse",
+    # Optional opt-in: hand the entire turn to a `codex app-server` subprocess
+    # so terminal/file-ops/patching/sandboxing run inside Codex's own runtime
+    # instead of Hermes' tool dispatch. Gated behind config key
+    # `model.openai_runtime == "codex_app_server"` AND provider in
+    # {"openai", "openai-codex"}. Default is unchanged.
+    "codex_app_server",
+}
 
 
 def _parse_api_mode(raw: Any) -> Optional[str]:
@@ -192,6 +191,32 @@ def _parse_api_mode(raw: Any) -> Optional[str]:
         if normalized in _VALID_API_MODES:
             return normalized
     return None
+
+
+def _maybe_apply_codex_app_server_runtime(
+    *,
+    provider: str,
+    api_mode: str,
+    model_cfg: Optional[Dict[str, Any]],
+) -> str:
+    """Optional opt-in: rewrite api_mode → "codex_app_server" for OpenAI/Codex
+    providers when the user has explicitly enabled that runtime via
+    `model.openai_runtime: codex_app_server` in config.yaml.
+
+    Default behavior is preserved: when the key is unset, "auto", or empty,
+    this function is a no-op. Only providers in {"openai", "openai-codex"}
+    are eligible — other providers (anthropic, openrouter, etc.) cannot be
+    rerouted through codex.
+
+    Returns the (possibly-rewritten) api_mode."""
+    if not model_cfg:
+        return api_mode
+    if provider not in ("openai", "openai-codex"):
+        return api_mode
+    runtime = str(model_cfg.get("openai_runtime") or "").strip().lower()
+    if runtime == "codex_app_server":
+        return "codex_app_server"
+    return api_mode
 
 
 def _resolve_runtime_from_pool_entry(
@@ -310,6 +335,12 @@ def _resolve_runtime_from_pool_entry(
     # https://opencode.ai/zen/go/v1/messages instead of .../v1/v1/messages).
     if api_mode == "anthropic_messages" and provider in {"opencode-zen", "opencode-go"}:
         base_url = re.sub(r"/v1/?$", "", base_url)
+
+    # Optional opt-in: route OpenAI/Codex turns through `codex app-server`.
+    # Inert when `model.openai_runtime` is unset or "auto".
+    api_mode = _maybe_apply_codex_app_server_runtime(
+        provider=provider, api_mode=api_mode, model_cfg=model_cfg
+    )
 
     return {
         "provider": provider,
@@ -897,15 +928,6 @@ def _resolve_explicit_runtime(
             api_key = creds.get("api_key", "")
             if not base_url:
                 base_url = creds.get("base_url", "").rstrip("/")
-            # Kimi OAuth fallback: if no env API key, try reading kimi-cli credentials.
-            # This path is hit when the CLI passes an explicit base_url from config.yaml
-            # (for example the old /coding/v1 URL) but no KIMI_API_KEY is set.
-            if provider == "kimi-coding" and not api_key:
-                oauth_creds = _try_kimi_oauth_credentials()
-                if oauth_creds:
-                    api_key = str(oauth_creds.get("api_key", "") or "").strip()
-                    if not base_url:
-                        base_url = str(oauth_creds.get("base_url", "") or "").rstrip("/")
 
         api_mode = "chat_completions"
         if provider == "copilot":
@@ -1320,15 +1342,6 @@ def resolve_runtime_provider(
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
         creds = resolve_api_key_provider_credentials(provider)
-        # Kimi Coding is fork-supported through the user's existing Kimi CLI
-        # OAuth session (~/.kimi/credentials/kimi-code.json). If no KIMI_API_KEY
-        # exists, use that OAuth token instead of returning an empty key that the
-        # CLI later replaces with no-key-required (which drops Kimi's required
-        # X-Msh headers and causes 404s).
-        if provider == "kimi-coding" and not str(creds.get("api_key", "") or "").strip():
-            oauth_creds = _try_kimi_oauth_credentials()
-            if oauth_creds:
-                creds = oauth_creds
         # Honour model.base_url from config.yaml when the configured provider
         # matches this provider — mirrors the Anthropic path above.  Without
         # this, users who set model.base_url to e.g. api.minimaxi.com/anthropic

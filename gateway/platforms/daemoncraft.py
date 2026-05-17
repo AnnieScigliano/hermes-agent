@@ -135,6 +135,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         self._plan_last_progress_at: float = 0.0
         self._plan_gc_timeout: int = (config.extra or {}).get("plan_gc_timeout_seconds", 300)
         self._turn_counter: int = 0  # Sequential turn counter for agent logs
+        self._last_idle_wake_up: float = 0.0  # Throttle idle wake-ups
 
         # Load allowlist by UUID (preferred) or username fallback.
         raw_allow = os.getenv("DAEMONCRAFT_ALLOWED_USERS", "").strip()
@@ -666,6 +667,14 @@ class DaemonCraftAdapter(BasePlatformAdapter):
             logger.info("[DaemonCraft] Wake-up reason: bot stuck (%s)", task.get("error", "unknown")[:60])
             return "wake_up"
 
+        # Idle heartbeat: wake up Steve so he can act autonomously
+        # (progress on achievements, scout, etc.) Throttle to avoid token spam.
+        now = time.time()
+        if now - self._last_idle_wake_up >= 90:
+            self._last_idle_wake_up = now
+            logger.info("[DaemonCraft] Wake-up reason: idle heartbeat (90s throttle)")
+            return "wake_up"
+
         return "context"
 
     async def _inject_synthetic_perceive(self, data: dict) -> None:
@@ -763,7 +772,18 @@ class DaemonCraftAdapter(BasePlatformAdapter):
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{embodied_url}/intent",
-                    json={"intent": intent, "autonomy_level": 1, "deadline_seconds": 15},
+                    json={
+                        "intent": intent,
+                        "autonomy_level": 1,
+                        "deadline_seconds": 15,
+                        "allowed_tools": [
+                            "scan_nearby",
+                            "get_inventory",
+                            "ask_clarification",
+                            "raise_guardian_event",
+                            "report_execution_error",
+                        ],
+                    },
                     timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
                     if resp.status == 200:

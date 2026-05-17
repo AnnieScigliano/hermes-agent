@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
@@ -482,12 +482,11 @@ def get_anthropic_key() -> str:
 # api.moonshot.ai/v1 (the old default).  Auto-detect when user hasn't set
 # KIMI_BASE_URL explicitly.
 #
-# Note: the base URL intentionally has NO /v1 suffix.  The /coding endpoint
-# speaks the Anthropic Messages protocol, and the anthropic SDK appends
-# "/v1/messages" internally — so "/coding" + SDK suffix → "/coding/v1/messages"
-# (the correct target). Using "/coding/v1" here would produce
-# "/coding/v1/v1/messages" (a 404).
-KIMI_CODE_BASE_URL = "https://api.kimi.com/coding"
+# Note: the /coding endpoint speaks the Anthropic Messages protocol.
+# The OpenAI-compatible surface is at /coding/v1/chat/completions.
+# Both /coding and /coding/v1 were valid at different times; current
+# Kimi Coding Plan requires /coding/v1 (without it → 404).
+KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
 
 
 def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) -> str:
@@ -4182,6 +4181,39 @@ def _snapshot_nous_pool_status() -> Dict[str, Any]:
         return _empty_nous_auth_status()
 
 
+# ── Process-level memo for get_nous_auth_status() ──
+# get_nous_auth_status() validates state by calling resolve_nous_runtime_credentials(),
+# which does a synchronous OAuth refresh POST to portal.nousresearch.com. That can take
+# ~350ms even on the failure path, and read-only UI surfaces (`hermes tools`, status panels,
+# subscription-feature checks) call it many times per render — `hermes tools` → "All Platforms"
+# was firing the refresh ~31× during one menu paint, racking up >13s of HTTP and burning
+# single-use refresh tokens. Cache the snapshot for a few seconds, keyed on the auth.json
+# mtime so that `hermes auth login/logout/add/remove` invalidate naturally on the next call.
+_NOUS_AUTH_STATUS_CACHE_TTL = 15.0  # seconds
+_nous_auth_status_cache: Optional[Tuple[float, Optional[float], Dict[str, Any]]] = None
+
+
+def _auth_file_mtime() -> Optional[float]:
+    try:
+        return _auth_file_path().stat().st_mtime
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+
+def invalidate_nous_auth_status_cache() -> None:
+    """Clear the get_nous_auth_status() process-level memo.
+
+    Call this from any code path that mutates Nous auth state without going
+    through resolve_nous_runtime_credentials() (e.g. tests). Login/logout
+    flows touch auth.json, so the mtime check below invalidates them
+    automatically — explicit invalidation is the belt-and-braces option.
+    """
+    global _nous_auth_status_cache
+    _nous_auth_status_cache = None
+
+
 def get_nous_auth_status() -> Dict[str, Any]:
     """Status snapshot for Nous auth.
 
@@ -4190,7 +4222,32 @@ def get_nous_auth_status() -> Dict[str, Any]:
     by resolving runtime credentials so revoked refresh sessions do not show up
     as a healthy login. If provider state is absent, fall back to the credential
     pool for the just-logged-in / not-yet-promoted case.
+
+    The returned snapshot is memoised for ~15s keyed on the auth.json mtime,
+    so menu/status surfaces that ask repeatedly don't trigger one refresh POST
+    per call. Login/logout flows write to auth.json and therefore invalidate
+    the cache automatically; tests can also call
+    ``invalidate_nous_auth_status_cache()`` explicitly.
     """
+    global _nous_auth_status_cache
+    now = time.monotonic()
+    mtime = _auth_file_mtime()
+    cached = _nous_auth_status_cache
+    if cached is not None:
+        cached_at, cached_mtime, cached_status = cached
+        if (
+            cached_mtime == mtime
+            and (now - cached_at) < _NOUS_AUTH_STATUS_CACHE_TTL
+        ):
+            return dict(cached_status)
+
+    status = _compute_nous_auth_status()
+    _nous_auth_status_cache = (now, mtime, dict(status))
+    return status
+
+
+def _compute_nous_auth_status() -> Dict[str, Any]:
+    """Uncached implementation of get_nous_auth_status(). See that function."""
     state = get_provider_auth_state("nous")
     if state:
         base_status = {
@@ -4403,6 +4460,24 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
     env_url = ""
     if pconfig.base_url_env_var:
         env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+
+    # Kimi OAuth fallback: when no env API key is set, try CLI OAuth credentials.
+    # This centralizes OAuth resolution so every consumer of this function
+    # (runtime_provider, auxiliary_client, etc.) gets OAuth automatically.
+    if not api_key and provider_id == "kimi-coding":
+        try:
+            oauth = resolve_kimi_coding_runtime_credentials(allow_api_key_fallback=False)
+            oauth_key = str(oauth.get("api_key", "") or "").strip()
+            if oauth_key:
+                api_key = oauth_key
+                key_source = str(oauth.get("source", "") or "").strip() or "kimi-cli-oauth"
+                oauth_url = str(oauth.get("base_url", "") or "").strip()
+                if oauth_url and not env_url:
+                    env_url = oauth_url
+        except Exception:
+            # OAuth not configured or unreadable — fall through to empty credentials
+            # so callers that expect missing keys get them gracefully.
+            pass
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
