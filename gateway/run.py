@@ -18825,7 +18825,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
-                    turn_timeout_seconds=turn_timeout_seconds,
+
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
