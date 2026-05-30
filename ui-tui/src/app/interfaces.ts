@@ -1,4 +1,4 @@
-import type { ScrollBoxHandle } from '@hermes/ink'
+import type { MouseTrackingMode, ScrollBoxHandle } from '@hermes/ink'
 import type { MutableRefObject, ReactNode, RefObject, SetStateAction } from 'react'
 
 import type { PasteEvent } from '../components/textInput.js'
@@ -105,7 +105,7 @@ export interface UiState {
   historyNavRequiresEmptyInput: boolean
   info: null | SessionInfo
   inlineDiffs: boolean
-  mouseTracking: boolean
+  mouseTracking: MouseTrackingMode
   sections: SectionVisibility
   showCost: boolean
   showReasoning: boolean
@@ -217,6 +217,7 @@ export interface InputHandlerContext {
     setProcessing: StateSetter<boolean>
     setRecording: StateSetter<boolean>
     setVoiceEnabled: StateSetter<boolean>
+    setVoiceTts: StateSetter<boolean>
   }
   wheelStep: number
 }
@@ -255,6 +256,7 @@ export interface GatewayEventHandlerContext {
     setProcessing: StateSetter<boolean>
     setRecording: StateSetter<boolean>
     setVoiceEnabled: StateSetter<boolean>
+    setVoiceTts: StateSetter<boolean>
   }
 }
 
@@ -278,6 +280,7 @@ export interface SlashHandlerContext {
   session: {
     closeSession: (targetSid?: null | string) => Promise<unknown>
     die: () => void
+    dieWithCode: (code: number) => void
     guardBusySessionSwitch: (what?: string) => boolean
     newSession: (msg?: string, title?: string) => void
     resetVisibleHistory: (info?: null | SessionInfo) => void
@@ -296,6 +299,7 @@ export interface SlashHandlerContext {
   voice: {
     setVoiceEnabled: StateSetter<boolean>
     setVoiceRecordKey: (v: ParsedVoiceRecordKey) => void
+    setVoiceTts: StateSetter<boolean>
   }
 }
 
@@ -351,7 +355,7 @@ export interface AppLayoutTranscriptProps {
 export interface AppLayoutProps {
   actions: AppLayoutActions
   composer: AppLayoutComposerProps
-  mouseTracking: boolean
+  mouseTracking: MouseTrackingMode
   progress: AppLayoutProgressProps
   status: AppLayoutStatusProps
   transcript: AppLayoutTranscriptProps

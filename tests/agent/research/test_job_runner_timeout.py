@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.live_system_guard_bypass
+
 from agent.research.job_runner import main as job_runner_main
 
 

@@ -17,6 +17,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytestmark = pytest.mark.live_system_guard_bypass
+
 from agent.research.job_runner import main as job_runner_main
 from tools.research_tool import check_research_stale
 

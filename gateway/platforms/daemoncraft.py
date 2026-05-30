@@ -496,39 +496,6 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         event_type = self._classify_heartbeat_event(data)
         logger.info("[DaemonCraft] Heartbeat classified as: %s", event_type)
 
-        # Process external events from agent_loop event queue
-        events = data.get("events") or []
-        chat_events = []
-        for ev in events:
-            ev_str = str(ev)
-            if ev_str.startswith("Chat from "):
-                # Parse "Chat from {player}: {message}"
-                match = ev_str.split(": ", 1)
-                if len(match) == 2:
-                    player_part = match[0].replace("Chat from ", "")
-                    message_text = match[1]
-                    chat_events.append({"from": player_part, "message": message_text})
-        
-        # Inject chat events as real messages before world state
-        for chat_ev in chat_events:
-            source = self.build_source(
-                chat_id=self._group_chat_id(),
-                chat_name="world",
-                chat_type="group",
-                user_id=chat_ev["from"],
-                user_name=chat_ev["from"],
-                thread_id="world",
-            )
-            source.profile = self._profile
-            event = MessageEvent(
-                text=chat_ev["message"],
-                message_type=MessageType.TEXT,
-                source=source,
-                raw_message=chat_ev,
-            )
-            logger.info("[DaemonCraft] Injected chat event from %s: %s", chat_ev["from"], chat_ev["message"][:80])
-            await self.handle_message(event)
-
         # Inject world state from the body (Gemma-Andy) instead of raw bot data
         await self._inject_embodied_world_state(data)
 

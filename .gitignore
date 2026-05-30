@@ -18,6 +18,8 @@ __pycache__/web_tools.cpython-310.pyc
 logs/
 data/
 .pytest_cache/
+test_durations.json
+.pytest-cache/
 tmp/
 temp_vision_images/
 hermes-*/*
@@ -70,7 +72,6 @@ mini-swe-agent/
 result
 website/static/api/skills-index.json
 models-dev-upstream/
-
-# Local project memory and session artifacts (never commit)
-.codex
-hermes_conversation_*.json
+hermes_cli/tui_dist/*
+hermes_cli/scripts/
+docs/superpowers/*

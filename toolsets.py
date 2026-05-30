@@ -53,7 +53,7 @@ _HERMES_CORE_TOOLS = [
     # Clarifying questions
     "clarify",
     # Code execution + delegation + research loop
-    "execute_code", "delegate_task", "run_research",
+    "execute_code", "delegate_task", "run_research", "research_job",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -86,6 +86,17 @@ TOOLSETS = {
     "search": {
         "description": "Web search only (no content extraction/scraping)",
         "tools": ["web_search"],
+        "includes": []
+    },
+
+    "x_search": {
+        "description": (
+            "Search X (Twitter) posts and threads via xAI's built-in "
+            "x_search Responses tool. Available when xAI credentials are "
+            "configured (SuperGrok OAuth or XAI_API_KEY). Off by default; "
+            "enable in `hermes tools` → X (Twitter) Search."
+        ),
+        "tools": ["x_search"],
         "includes": []
     },
     
@@ -145,13 +156,13 @@ TOOLSETS = {
         "tools": ["skills_list", "skill_view", "skill_manage"],
         "includes": []
     },
-
+    
     "research": {
-        "description": "Iterative self-improving research loop: run_research spawns worker subagents, scores output against a metric, and applies LLM-guided hypothesis revision across iterations (Karpathy + Autogenesis AOOR loop). research_job is the detached, resumable variant for long-running loops (>5min).",
+        "description": "Iterative self-improving research loop: run_research spawns worker subagents, scores output against a metric, and applies LLM-guided hypothesis revision across iterations. research_job is the detached, resumable variant for long-running loops (>5min).",
         "tools": ["run_research", "research_job"],
         "includes": []
     },
-    
+
     "browser": {
         "description": "Browser automation for web interaction (navigate, click, type, scroll, iframes, hold-click) with web search for finding URLs",
         "tools": [
@@ -175,18 +186,7 @@ TOOLSETS = {
         "tools": ["send_message"],
         "includes": []
     },
-    
-    "rl": {
-        "description": "RL training tools for running reinforcement learning on Tinker-Atropos",
-        "tools": [
-            "rl_list_environments", "rl_select_environment",
-            "rl_get_current_config", "rl_edit_config",
-            "rl_start_training", "rl_check_status",
-            "rl_stop_training", "rl_get_results",
-            "rl_list_runs", "rl_test_inference"
-        ],
-        "includes": []
-    },
+
     
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
@@ -260,6 +260,17 @@ TOOLSETS = {
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
+        ],
+        "includes": [],
+    },
+
+    "minecraft": {
+        "description": "Minecraft embodied agent tools — perceive, navigate, build, craft, combat, manage, screenshot, command, story, registry",
+        "tools": [
+            "mc_perceive", "mc_move", "mc_mine", "mc_build",
+            "mc_craft", "mc_combat", "mc_manage", "mc_plan",
+            "mc_screenshot", "mc_command", "mc_story", "mc_registry",
+            "mc_chat", "mc_no_op",
         ],
         "includes": [],
     },
@@ -396,7 +407,7 @@ TOOLSETS = {
         # Mirrors hermes-cli so cron's "default" toolset is the same set of
         # core tools users see interactively — then `hermes tools` filters
         # them down per the platform config. _DEFAULT_OFF_TOOLSETS (moa,
-        # homeassistant, rl) are excluded by _get_platform_tools() unless
+        # homeassistant) are excluded by _get_platform_tools() unless
         # the user explicitly enables them.
         "description": "Default cron toolset - same core tools as hermes-cli; gated by `hermes tools`",
         "tools": _HERMES_CORE_TOOLS,

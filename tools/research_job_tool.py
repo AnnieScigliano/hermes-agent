@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import secrets
 import shlex
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -36,30 +36,28 @@ def _write_job_spec(job_id: str, spec: dict[str, Any]) -> Path:
 def _load_config_for_job() -> dict[str, Any]:
     """Read Hermes config to extract model/provider/base_url for the runner.
 
-    For api_key resolution: when KIMI_API_KEY is set, we pin it in the spec
-    so the detached runner uses the explicit override. When unset (the
-    typical case on this fork, where Kimi auth is OAuth via
-    ~/.kimi/credentials/kimi-code.json), we omit the field entirely so
-    the auxiliary_client falls through to resolve_kimi_coding_runtime_credentials
-    and picks up the OAuth access_token. Pinning api_key="" here would force
-    the resolver to treat that as an explicit (empty) override.
+    Detached jobs inherit the user's configured delegation runtime first, then
+    the main model runtime. Do not hardcode a provider here: providers imply
+    cost/privacy, and this tool should preserve the user's existing choice.
     """
     import yaml
     config_path = get_hermes_home() / "config.yaml"
     if not config_path.exists():
         return {}
-    cfg = yaml.safe_load(config_path.read_text())
+    cfg = yaml.safe_load(config_path.read_text()) or {}
     model_cfg = cfg.get("model", {})
+    if not isinstance(model_cfg, dict):
+        model_cfg = {"default": model_cfg} if isinstance(model_cfg, str) else {}
     delegation_cfg = cfg.get("delegation", {})
+    if not isinstance(delegation_cfg, dict):
+        delegation_cfg = {}
     spec = {
-        "model": delegation_cfg.get("model") or model_cfg.get("default", "kimi-for-coding"),
-        "provider": delegation_cfg.get("provider") or model_cfg.get("provider", "kimi-coding"),
-        "base_url": delegation_cfg.get("base_url") or model_cfg.get("base_url", "https://api.kimi.com/coding/v1"),
+        "model": delegation_cfg.get("model") or model_cfg.get("default"),
+        "provider": delegation_cfg.get("provider") or model_cfg.get("provider"),
+        "base_url": delegation_cfg.get("base_url") or model_cfg.get("base_url"),
+        "api_mode": delegation_cfg.get("api_mode") or model_cfg.get("api_mode"),
     }
-    api_key = os.getenv("KIMI_API_KEY", "").strip()
-    if api_key:
-        spec["api_key"] = api_key
-    return spec
+    return {k: v for k, v in spec.items() if v}
 
 
 # ---------------------------------------------------------------------------
@@ -184,25 +182,21 @@ def _action_start(args: dict[str, Any]) -> str:
         "initial_attempt": args.get("initial_attempt", ""),
         "acceptance_criterion": args.get("acceptance_criterion", ""),
         "timeout_sec": args.get("timeout_sec", 0),
-        "model": cfg.get("model"),
-        "provider": cfg.get("provider"),
-        "base_url": cfg.get("base_url"),
         "toolsets": ["research", "terminal", "file", "web"],
     }
-    # Only pin api_key in the spec when it's an explicit override (env var
-    # set). Omitting it lets the detached runner resolve OAuth credentials
-    # via the standard auxiliary_client path.
-    if cfg.get("api_key"):
-        spec["api_key"] = cfg["api_key"]
-
+    spec.update(cfg)
     spec_path = _write_job_spec(job_id, spec)
     job_dir = _job_dir(job_id)
 
     hermes_root = get_hermes_home() / "hermes-agent"
+    python_bin = hermes_root / "venv" / "bin" / "python"
+    if not python_bin.exists():
+        python_bin = hermes_root / ".venv" / "bin" / "python"
+    if not python_bin.exists():
+        python_bin = Path(sys.executable)
     cmd = (
-        f"cd {shlex.quote(str(hermes_root))} && "
-        f"source venv/bin/activate && "
-        f"HERMES_YOLO_MODE=1 python -m agent.research.job_runner {shlex.quote(str(spec_path))}"
+        f"HERMES_YOLO_MODE=1 {shlex.quote(str(python_bin))} "
+        f"-m agent.research.job_runner {shlex.quote(str(spec_path))}"
     )
 
     # Spawn via terminal_tool in background
@@ -336,10 +330,14 @@ def _action_resume(args: dict[str, Any]) -> str:
     state_path.write_text(json.dumps(state, indent=2))
 
     hermes_root = get_hermes_home() / "hermes-agent"
+    python_bin = hermes_root / "venv" / "bin" / "python"
+    if not python_bin.exists():
+        python_bin = hermes_root / ".venv" / "bin" / "python"
+    if not python_bin.exists():
+        python_bin = Path(sys.executable)
     cmd = (
-        f"cd {shlex.quote(str(hermes_root))} && "
-        f"source venv/bin/activate && "
-        f"HERMES_YOLO_MODE=1 python -m agent.research.job_runner {shlex.quote(str(spec_path))}"
+        f"HERMES_YOLO_MODE=1 {shlex.quote(str(python_bin))} "
+        f"-m agent.research.job_runner {shlex.quote(str(spec_path))}"
     )
 
     from tools.terminal_tool import terminal_tool

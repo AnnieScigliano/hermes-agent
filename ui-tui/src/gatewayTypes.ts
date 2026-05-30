@@ -1,4 +1,4 @@
-import type { SessionInfo, SlashCategory, Usage } from './types.js'
+import type { SessionInfo, SlashCategory, SubagentStatus, Usage } from './types.js'
 
 export interface GatewaySkin {
   banner_hero?: string
@@ -398,7 +398,7 @@ export interface SubagentEventPayload {
   output_tokens?: number
   parent_id?: null | string
   reasoning_tokens?: number
-  status?: 'completed' | 'failed' | 'interrupted' | 'queued' | 'running'
+  status?: SubagentStatus
   subagent_id?: string
   summary?: string
   task_count?: number
@@ -481,11 +481,11 @@ export type GatewayEvent =
       type: 'gateway.start_timeout'
     }
   | { payload?: { preview?: string }; session_id?: string; type: 'gateway.protocol_error' }
-  | { payload?: { text?: string }; session_id?: string; type: 'reasoning.delta' | 'reasoning.available' }
+  | { payload?: { text?: string; verbose?: boolean }; session_id?: string; type: 'reasoning.delta' | 'reasoning.available' }
   | { payload: { name?: string; preview?: string }; session_id?: string; type: 'tool.progress' }
   | { payload: { name?: string }; session_id?: string; type: 'tool.generating' }
   | {
-      payload: { context?: string; name?: string; tool_id: string; todos?: unknown[] }
+      payload: { args_text?: string; context?: string; name?: string; tool_id: string; todos?: unknown[] }
       session_id?: string
       type: 'tool.start'
     }
@@ -495,6 +495,7 @@ export type GatewayEvent =
         error?: string
         inline_diff?: string
         name?: string
+        result_text?: string
         summary?: string
         tool_id: string
         todos?: unknown[]
