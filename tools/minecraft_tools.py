@@ -160,6 +160,18 @@ def _fmt(resp: dict) -> str:
     parts = []
     if "result" in resp:
         parts.append(f"Result: {resp['result']}")
+    # Include judge if present (before state — agent needs to see outcome first)
+    if "_judge" in resp and isinstance(resp["_judge"], dict):
+        j = resp["_judge"]
+        j_parts = [f"Judge: {j.get('outcome', '?')} ({j.get('confidence', '?')})"]
+        if j.get("reason_code"):
+            j_parts.append(f"[{j['reason_code']}]")
+        delta = j.get("position_delta")
+        if delta:
+            j_parts.append(f"Delta: dx={delta.get('dx',0):+.1f}, dy={delta.get('dy',0):+.1f}, dz={delta.get('dz',0):+.1f}")
+        if j.get("error"):
+            j_parts.append(f"Error: {j['error']}")
+        parts.append(" ".join(j_parts))
     if "task_id" in resp:
         parts.append(f"Task {resp['task_id']} started ({resp.get('status', 'running')})")
     if "task" in resp and isinstance(resp.get("task"), dict):
@@ -993,6 +1005,174 @@ MC_PLAN_SCHEMA = {
 
 
 # ═══════════════════════════════════════════════════════════════════
+# 9b. mc_plan_decompose — Fase 3 strategic plan decomposition (Hermes LLM)
+# ═══════════════════════════════════════════════════════════════════
+#
+# Hermes (Steve / cloud LLM) calls this tool to break a high-level goal into
+# an ordered PlanManifest of SubPlans. Every SubPlan **MUST** include a
+# machine-checkable "verify" spec — this is the non-negotiable anti-hallucination
+# guard from the GePeTo contract. The Python handler + PlanOrchestrator both
+# reject manifests lacking verify.
+#
+# The returned JSON can be consumed by the body (agent_loop PlanOrchestrator)
+# or re-injected into future heartbeats for cross-layer visibility.
+#
+# Intent strings are embodied-level (understood by Gemma-Andy via /intent).
+# Verify types: INVENTORY_HAS | AREA_CLEAR | POSITION_REACHED | BLOCK_PLACED | ENTITY_NEARBY
+
+def _handle_mc_plan_decompose(args: dict, **kwargs) -> str:
+    """Decompose a complex goal into verifiable sub-plans.
+
+    The LLM must supply a 'verify' object for **every** entry in sub_plans.
+    Missing verify → immediate error (forces correct decomposition).
+    """
+    goal = (args.get("goal") or "").strip()
+    if not goal:
+        return "Error: 'goal' is required for mc_plan_decompose"
+
+    raw_subs = args.get("sub_plans") or []
+    if not isinstance(raw_subs, list) or len(raw_subs) == 0:
+        return "Error: 'sub_plans' must be a non-empty array"
+
+    cleaned: list[dict[str, Any]] = []
+    for idx, sp in enumerate(raw_subs):
+        if not isinstance(sp, dict):
+            return f"Error: sub_plans[{idx}] must be an object"
+        intent = (sp.get("intent") or "").strip()
+        if not intent:
+            return f"Error: sub_plans[{idx}] requires non-empty 'intent'"
+
+        verify = sp.get("verify")
+        if not isinstance(verify, dict) or not verify.get("type"):
+            return (
+                f"Error: sub_plans[{idx}] (intent={intent[:50]}) is MISSING REQUIRED 'verify' dict "
+                "with 'type' (INVENTORY_HAS / AREA_CLEAR / POSITION_REACHED / BLOCK_PLACED / ENTITY_NEARBY). "
+                "This is the anti-hallucination guard — every step must be machine-verifiable."
+            )
+
+        try:
+            order = int(sp.get("order", idx))
+        except Exception:
+            order = idx
+        depends = sp.get("depends_on") or []
+        if not isinstance(depends, list):
+            depends = []
+
+        cleaned.append({
+            "intent": intent,
+            "verify": verify,
+            "order": order,
+            "depends_on": depends,
+        })
+
+    manifest: dict[str, Any] = {
+        "goal": goal,
+        "sub_plans": cleaned,
+        "estimated_time_s": int(args.get("estimated_time_s", 300)),
+        "abort_on_failure": bool(args.get("abort_on_failure", True)),
+    }
+
+    # Best-effort forward to bot server (future /plan/manifest endpoint).
+    # If the endpoint does not exist yet the manifest is still returned validated.
+    forwarded = False
+    try:
+        resp = _api_post("/plan/manifest", {"action": "set_manifest", "manifest": manifest}, timeout=8)
+        if isinstance(resp, dict) and resp.get("ok"):
+            forwarded = True
+    except Exception:
+        # Non-fatal — the validated manifest is still useful to the caller / body layer.
+        pass
+
+    payload = {
+        "ok": True,
+        "manifest": manifest,
+        "forwarded_to_body": forwarded,
+        "note": "Every sub-plan carries a VerifySpec. Use PlanOrchestrator.execute_plan() in the body to run.",
+    }
+    return json.dumps(payload, indent=2)
+
+
+MC_PLAN_DECOMPOSE_SCHEMA = {
+    "name": "mc_plan_decompose",
+    "description": (
+        "Fase 3: Decompose a high-level, multi-step Minecraft goal into an ordered PlanManifest. "
+        "Hermes (the strategic LLM) is responsible for producing the decomposition. "
+        "CRITICAL: every object in 'sub_plans' MUST contain a 'verify' field (object) with 'type' "
+        "and the parameters matching that type. Supported verify types: INVENTORY_HAS (item+count), "
+        "AREA_CLEAR (x1,z1,x2,z2,y,max_blocks_above), POSITION_REACHED (target_x/y/z + max_distance), "
+        "BLOCK_PLACED (block_x/y/z + block_material), ENTITY_NEARBY (entity_type + entity_distance). "
+        "The handler and PlanOrchestrator will reject any sub-plan lacking a valid verify — this prevents hallucinated steps. "
+        "depends_on is a list of 'order' values from other sub-plans. order values should be unique and ascending for sequential steps."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": "The high-level natural language goal to decompose (e.g. 'build a small wooden house with door and roof')",
+            },
+            "sub_plans": {
+                "type": "array",
+                "description": "Ordered list of atomic, verifiable sub-plans. Execution order is determined by 'order' + 'depends_on'.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "intent": {
+                            "type": "string",
+                            "description": "Embodied intent string passed to Gemma/embodied service (e.g. 'mine 64 oak_log', 'goto 128 64 -80', 'craft 4 oak_planks')",
+                        },
+                        "verify": {
+                            "type": "object",
+                            "description": "MANDATORY machine-checkable verification predicate. Must include 'type' + params for that type.",
+                            "properties": {
+                                "type": {"type": "string", "enum": ["INVENTORY_HAS", "AREA_CLEAR", "POSITION_REACHED", "BLOCK_PLACED", "ENTITY_NEARBY"]},
+                                # inventory
+                                "item": {"type": "string"},
+                                "count": {"type": "integer"},
+                                # area_clear
+                                "x1": {"type": "integer"}, "z1": {"type": "integer"},
+                                "x2": {"type": "integer"}, "z2": {"type": "integer"},
+                                "y": {"type": "integer"}, "max_blocks_above": {"type": "integer"},
+                                # position
+                                "target_x": {"type": "integer"}, "target_y": {"type": "integer"}, "target_z": {"type": "integer"},
+                                "max_distance": {"type": "number"},
+                                # block_placed
+                                "block_x": {"type": "integer"}, "block_y": {"type": "integer"}, "block_z": {"type": "integer"},
+                                "block_material": {"type": "string"},
+                                # entity
+                                "entity_type": {"type": "string"},
+                                "entity_distance": {"type": "number"},
+                            },
+                            "required": ["type"],
+                        },
+                        "order": {
+                            "type": "integer",
+                            "description": "Execution priority / sequence number. Lower runs earlier. Must be unique within manifest.",
+                        },
+                        "depends_on": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "List of 'order' values that must complete before this sub-plan may start.",
+                        },
+                    },
+                    "required": ["intent", "verify", "order"],
+                },
+            },
+            "estimated_time_s": {
+                "type": "integer",
+                "description": "Rough total time budget for the whole manifest (seconds).",
+            },
+            "abort_on_failure": {
+                "type": "boolean",
+                "description": "If true (default), first VerifySpec failure escalates to Hermes with previous_error for replanning.",
+            },
+        },
+        "required": ["goal", "sub_plans"],
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
 # 10. mc_screenshot — Ray-traced world capture
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1573,42 +1753,36 @@ registry.register(
     toolset="minecraft",
     schema=MC_PERCEIVE_SCHEMA,
     handler=lambda args, **kw: _handle_mc_perceive(args, **kw),
-    check_fn=check_minecraft_available,
 )
 registry.register(
     name="mc_move",
     toolset="minecraft",
     schema=MC_MOVE_SCHEMA,
     handler=lambda args, **kw: _handle_mc_move(args, **kw),
-    check_fn=check_minecraft_available,
 )
 registry.register(
     name="mc_mine",
     toolset="minecraft",
     schema=MC_MINE_SCHEMA,
     handler=lambda args, **kw: _handle_mc_mine(args, **kw),
-    check_fn=check_minecraft_available,
 )
 registry.register(
     name="mc_build",
     toolset="minecraft",
     schema=MC_BUILD_SCHEMA,
     handler=lambda args, **kw: _handle_mc_build(args, **kw),
-    check_fn=check_minecraft_available,
 )
 registry.register(
     name="mc_craft",
     toolset="minecraft",
     schema=MC_CRAFT_SCHEMA,
     handler=lambda args, **kw: _handle_mc_craft(args, **kw),
-    check_fn=check_minecraft_available,
 )
 registry.register(
     name="mc_combat",
     toolset="minecraft",
     schema=MC_COMBAT_SCHEMA,
     handler=lambda args, **kw: _handle_mc_combat(args, **kw),
-    check_fn=check_minecraft_available,
 )
 # ── Environment flag: loop mode suppresses mc_chat registration ──
 # The gateway (social layer) needs mc_chat. The loop (body layer) does not.
@@ -1618,7 +1792,6 @@ if not os.getenv("DC_LOOP_MODE"):
         toolset="minecraft",
         schema=MC_CHAT_SCHEMA,
         handler=lambda args, **kw: _handle_mc_chat(args, **kw),
-        check_fn=check_minecraft_available,
     )
 else:
     print("[minecraft_tools] DC_LOOP_MODE=1 — mc_chat tool suppressed for body-only mode", flush=True)
@@ -1627,28 +1800,24 @@ registry.register(
     toolset="minecraft",
     schema=MC_MANAGE_SCHEMA,
     handler=lambda args, **kw: _handle_mc_manage(args, **kw),
-    check_fn=check_minecraft_available,
 )
 registry.register(
     name="mc_plan",
     toolset="minecraft",
     schema=MC_PLAN_SCHEMA,
     handler=lambda args, **kw: _handle_mc_plan(args, **kw),
-    check_fn=check_minecraft_available,
 )
 registry.register(
     name="mc_screenshot",
     toolset="minecraft",
     schema=MC_SCREENSHOT_SCHEMA,
     handler=lambda args, **kw: _handle_mc_screenshot(args, **kw),
-    check_fn=check_minecraft_available,
 )
 registry.register(
     name="mc_command",
     toolset="minecraft",
     schema=MC_COMMAND_SCHEMA,
     handler=lambda args, **kw: _handle_mc_command(args, **kw),
-    check_fn=check_minecraft_available,
 )
 MC_NOOP_SCHEMA = {
     "type": "object",
@@ -1670,7 +1839,6 @@ registry.register(
     toolset="minecraft",
     schema=MC_STORY_SCHEMA,
     handler=lambda args, **kw: _handle_mc_story(args, **kw),
-    check_fn=check_minecraft_available,
 )
 
 registry.register(
@@ -1678,7 +1846,44 @@ registry.register(
     toolset="minecraft",
     schema=MC_REGISTRY_SCHEMA,
     handler=lambda args, **kw: _handle_mc_registry(args, **kw),
-    check_fn=check_minecraft_available,
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# mc_interoception — Body-internal state (health, hunger, runner activity)
+# ═══════════════════════════════════════════════════════════════════
+
+MC_INTEROCEPTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "detail": {
+            "type": "boolean",
+            "description": "If true, return full reflex history (capped at 10). Default: summary view (last 3 with timestamps + aggregated count of older).",
+        },
+    },
+}
+
+def _handle_mc_interoception(args: dict, **kwargs) -> str:
+    """Query body-internal state: health, food, holding, position, runner activity.
+
+    Returns a delta of what the body (L2 runner) has been doing since the last
+    query. Each call updates the `since` timestamp — the next call only returns
+    new activity.
+
+    Args:
+        detail: If True, return full reflex history. Default: summary.
+    """
+    detail = args.get("detail", False)
+    params = f"?detail={'true' if detail else 'false'}"
+    resp = _api_get(f"/interoception{params}")
+    if not resp.get("ok", True):
+        return f"Error: {resp.get('error', 'interoception unavailable')}"
+    return json.dumps(resp.get("data", {}), indent=2)
+
+registry.register(
+    name="mc_interoception",
+    toolset="minecraft",
+    schema=MC_INTEROCEPTION_SCHEMA,
+    handler=lambda args, **kw: _handle_mc_interoception(args, **kw),
 )
 
 registry.register(
@@ -1686,5 +1891,312 @@ registry.register(
     toolset="minecraft",
     schema=MC_NOOP_SCHEMA,
     handler=lambda args, **kw: _handle_mc_noop(args, **kw),
-    check_fn=check_minecraft_available,
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# mc_plan_decompose — Hermes decomposes multi-step goals into PlanManifest
+# ═══════════════════════════════════════════════════════════════════
+
+MC_PLAN_DECOMPOSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "goal": {
+            "type": "string",
+            "description": "Natural language description of the multi-step goal to decompose.",
+        },
+        "context": {
+            "type": "object",
+            "description": "Optional: current world state (position, inventory summary, nearby entities). Helps Hermes produce grounded sub-plans.",
+        },
+    },
+    "required": ["goal"],
+}
+
+
+def _handle_mc_plan_decompose(args: dict, **kwargs) -> str:
+    """Decompose a multi-step goal into a PlanManifest with verified SubPlans.
+
+    Hermes (LLM) is responsible for generating the sub-plan structure. This tool:
+    1. Receives the goal + context
+    2. Returns a PlanManifest-ready JSON schema for Hermes to fill in
+    3. Validates that every SubPlan has a VerifySpec (anti-hallucination guard)
+
+    The actual decomposition happens in the LLM's response — this tool provides
+    the contract and validation. The PlanOrchestrator (DaemonCraft Fase 3) executes
+    the manifest.
+
+    Returns a JSON schema template for PlanManifest that Hermes should populate,
+    plus the validation rules.
+    """
+    goal = args.get("goal", "")
+    context = args.get("context", {})
+
+    if not goal or not goal.strip():
+        return json.dumps({"error": "mc_plan_decompose requires non-empty 'goal'"})
+
+    return json.dumps({
+        "instruction": (
+            "Decompose the following goal into a PlanManifest. "
+            "Each SubPlan MUST have a 'verify' block. "
+            "Supported verify types: INVENTORY_HAS, POSITION_REACHED, AREA_CLEAR, "
+            "BLOCK_PLACED, ENTITY_NEARBY. "
+            "Return the manifest as a JSON object matching this schema."
+        ),
+        "goal": goal,
+        "context": context,
+        "schema": {
+            "goal": "<string: original goal>",
+            "estimated_time_s": 300,
+            "abort_on_failure": True,
+            "sub_plans": [
+                {
+                    "intent": "<embodied intent string, e.g. 'mine 64 oak_log'>",
+                    "order": 0,
+                    "depends_on": [],
+                    "verify": {
+                        "type": "INVENTORY_HAS",
+                        "item": "oak_log",
+                        "count": 64,
+                    },
+                },
+            ],
+        },
+        "validation_rules": [
+            "Every sub_plan MUST have a 'verify' block with a valid 'type'.",
+            "Verify type INVENTORY_HAS requires 'item' and 'count'.",
+            "Verify type POSITION_REACHED requires 'target_x', 'target_y', 'target_z'.",
+            "depends_on must reference valid 'order' values (not self, not future if order < dep).",
+            "No sub-plan without verify will be executed (anti-hallucination guard).",
+        ],
+    })
+
+
+registry.register(
+    name="mc_plan_decompose",
+    toolset="minecraft",
+    schema=MC_PLAN_DECOMPOSE_SCHEMA,
+    handler=lambda args, **kw: _handle_mc_plan_decompose(args, **kw),
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# mc_start_quantified_intent — Hermes starts tracking a quantified intent
+# ═══════════════════════════════════════════════════════════════════
+
+MC_START_QUANTIFIED_INTENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intent_type": {
+            "type": "string",
+            "description": "Intent type: 'mine', 'gather', 'collect', etc.",
+        },
+        "target_count": {
+            "type": "integer",
+            "description": "How many to mine/gather (e.g. 64).",
+        },
+        "verify_spec": {
+            "type": "object",
+            "description": "Optional verify spec. If omitted, executor uses best-effort tracking.",
+            "properties": {
+                "type": {"type": "string", "description": "VerifyType: INVENTORY_HAS, etc."},
+                "item": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+        },
+    },
+    "required": ["intent_type", "target_count"],
+}
+
+
+def _handle_mc_start_quantified_intent(args: dict, **kwargs) -> str:
+    """Start tracking a quantified intent via the bot server's shared state.
+
+    Writes to executor_intent.json, which agent_loop.py polls on heartbeat ticks.
+    The QuantifiedIntentExecutor snapshots inventory baseline and tracks progress
+    across L2 reflex preemption.
+
+    Args:
+        intent_type: 'mine', 'gather', 'collect', etc.
+        target_count: How many units to track (e.g. 64)
+        verify_spec: Optional dict with {type, item, count}
+    """
+    intent_type = args.get("intent_type", "")
+    target_count = int(args.get("target_count", 0))
+    verify_spec = args.get("verify_spec")
+
+    if not intent_type or target_count <= 0:
+        return json.dumps({"error": "intent_type and target_count > 0 required"})
+
+    payload = {
+        "intent_type": intent_type,
+        "target_count": target_count,
+        "verify_spec": verify_spec,
+    }
+    resp = _api_post("/executor/start-intent", payload)
+    if not resp.get("ok"):
+        return f"Error: {resp.get('error', 'start-intent failed')}"
+    return json.dumps(resp.get("data", {}))
+
+
+registry.register(
+    name="mc_start_quantified_intent",
+    toolset="minecraft",
+    schema=MC_START_QUANTIFIED_INTENT_SCHEMA,
+    handler=lambda args, **kw: _handle_mc_start_quantified_intent(args, **kw),
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# mc_submit_plan — Hermes submits a PlanManifest for orchestration
+# ═══════════════════════════════════════════════════════════════════
+
+MC_SUBMIT_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "manifest": {
+            "type": "object",
+            "description": "Full PlanManifest dict matching the schema from mc_plan_decompose.",
+        },
+    },
+    "required": ["manifest"],
+}
+
+
+def _handle_mc_submit_plan(args: dict, **kwargs) -> str:
+    """Submit a PlanManifest for execution by the PlanOrchestrator.
+
+    Writes to plan_manifest.json, which agent_loop.py polls on heartbeat ticks.
+    The orchestrator validates (anti-hallucination guard: every SubPlan must
+    have a VerifySpec) and executes sub-plans respecting order and depends_on.
+
+    Use mc_plan_decompose first to get the schema + validation rules,
+    then call mc_submit_plan with the completed manifest.
+    """
+    manifest = args.get("manifest")
+    if not manifest:
+        return json.dumps({"error": "manifest is required"})
+
+    payload = {"manifest": manifest}
+    resp = _api_post("/plan/submit", payload)
+    if not resp.get("ok"):
+        return f"Error: {resp.get('error', 'plan submission failed')}"
+    return json.dumps(resp.get("data", {"received": True}))
+
+
+registry.register(
+    name="mc_submit_plan",
+    toolset="minecraft",
+    schema=MC_SUBMIT_PLAN_SCHEMA,
+    handler=lambda args, **kw: _handle_mc_submit_plan(args, **kw),
+)
+
+# ═══════════════════════════════════════════════════════════════════
+# mc_macro — Pre-canned multi-step skills (staircase, spiral, etc.)
+# ═══════════════════════════════════════════════════════════════════
+
+MC_MACRO_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "macro": {
+            "type": "string",
+            "enum": ["staircase", "spiral", "tunnel"],
+            "description": "Which macro skill to execute. 'staircase' mines a 1-wide diagonal staircase upward in a cardinal direction. 'spiral' rotates direction every N steps to create a caracol staircase. 'tunnel' mines a 2-high 1-wide horizontal tunnel in a cardinal direction."
+        },
+        "direction": {
+            "type": "string",
+            "enum": ["west", "east", "north", "south"],
+            "description": "Cardinal direction. Required for 'staircase' and 'tunnel'."
+        },
+        "target_y": {
+            "type": "number",
+            "description": "Target Y level. Required for 'staircase' and 'spiral'."
+        },
+        "steps_per_side": {
+            "type": "number",
+            "description": "For 'spiral': steps before rotating 90°. 2 = tight spiral with 1-block center pillar. Default 3."
+        },
+        "distance": {
+            "type": "number",
+            "description": "For 'tunnel': how many blocks to tunnel. Default 10."
+        },
+    },
+    "required": ["macro"],
+}
+
+
+def _handle_mc_macro(args: dict, **kwargs) -> str:
+    """Execute a pre-canned macro skill via POST /macro."""
+    macro = args.get("macro")
+    if not macro:
+        return "Error: 'macro' is required. Available: staircase, spiral"
+
+    if macro == "staircase":
+        direction = args.get("direction")
+        target_y = args.get("target_y")
+        if not direction:
+            return "Error: 'direction' is required for staircase (west/east/north/south)"
+        if target_y is None:
+            return "Error: 'target_y' is required for staircase"
+
+        resp = _api_post("/macro", {
+            "macro": "staircase",
+            "direction": direction,
+            "target_y": target_y,
+        }, timeout=600)
+
+        if not resp.get("ok"):
+            return f"Error: {resp.get('error', 'staircase failed')}"
+        return (
+            f"{resp.get('message', 'Done.')}\n"
+            f"steps: {resp.get('steps', '?')}, "
+            f"finalY: {resp.get('finalY', '?')}"
+        )
+
+    if macro == "spiral":
+        target_y = args.get("target_y")
+        steps_per_side = args.get("steps_per_side")
+        if target_y is None:
+            return "Error: 'target_y' is required for spiral"
+
+        body = {"macro": "spiral", "target_y": target_y}
+        if steps_per_side is not None:
+            body["steps_per_side"] = steps_per_side
+
+        resp = _api_post("/macro", body, timeout=600)
+
+        if not resp.get("ok"):
+            return f"Error: {resp.get('error', 'spiral failed')}"
+        return (
+            f"{resp.get('message', 'Done.')}\n"
+            f"steps: {resp.get('steps', '?')}, "
+            f"finalY: {resp.get('finalY', '?')}"
+        )
+
+    if macro == "tunnel":
+        direction = args.get("direction")
+        distance = args.get("distance", 10)
+        if not direction:
+            return "Error: 'direction' is required for tunnel (west/east/north/south)"
+
+        resp = _api_post("/macro", {
+            "macro": "tunnel",
+            "direction": direction,
+            "distance": distance,
+        }, timeout=600)
+
+        if not resp.get("ok"):
+            return f"Error: {resp.get('error', 'tunnel failed')}"
+        return (
+            f"{resp.get('message', 'Done.')}\n"
+            f"steps: {resp.get('steps', '?')}, "
+            f"from: ({resp.get('startPos', {}).get('x', '?')},{resp.get('startPos', {}).get('y', '?')},{resp.get('startPos', {}).get('z', '?')}), "
+            f"to: ({resp.get('endPos', {}).get('x', '?')},{resp.get('endPos', {}).get('y', '?')},{resp.get('endPos', {}).get('z', '?')})"
+        )
+
+    return f"Error: unknown macro '{macro}'. Available: staircase, spiral, tunnel"
+
+
+registry.register(
+    name="mc_macro",
+    toolset="minecraft",
+    schema=MC_MACRO_SCHEMA,
+    handler=lambda args, **kw: _handle_mc_macro(args, **kw),
 )

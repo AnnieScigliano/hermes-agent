@@ -23,9 +23,6 @@ from agent.prompt_builder import _scan_context_content
 
 logger = logging.getLogger(__name__)
 
-# Module-level cache for subdirectory hints to avoid repeated disk reads
-_hint_cache: dict[tuple[str, str], Optional[str]] = {}
-
 # Context files to look for in subdirectories, in priority order.
 # Same filenames as prompt_builder.py but we load ALL found (not first-wins)
 # since different subdirectories may use different conventions.
@@ -47,6 +44,15 @@ _COMMAND_TOOLS = {"terminal"}
 # How many parent directories to walk up when looking for hints.
 # Prevents scanning all the way to / for deeply nested paths.
 _MAX_ANCESTOR_WALK = 5
+
+
+def _is_ancestor_or_same(a: Path, b: Path) -> bool:
+    """Check if *a* is the same as or an ancestor of *b* (parent directory check)."""
+    try:
+        b.relative_to(a)
+        return True
+    except ValueError:
+        return False
 
 class SubdirectoryHintTracker:
     """Track which directories the agent visits and load hints on first access.
@@ -161,7 +167,13 @@ class SubdirectoryHintTracker:
             self._add_path_candidate(token, candidates)
 
     def _is_valid_subdir(self, path: Path) -> bool:
-        """Check if path is a valid directory to scan for hints."""
+        """Check if path is a valid directory to scan for hints.
+
+        Only allow subdirectories within the working directory tree.
+        This prevents loading AGENTS.md from outside the active workspace
+        (e.g. ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md), which causes
+        cross-agent context contamination and instruction mixup.
+        """
         try:
             if not path.is_dir():
                 return False
@@ -169,18 +181,42 @@ class SubdirectoryHintTracker:
             return False
         if path in self._loaded_dirs:
             return False
+        # Reject paths outside the working directory tree.
+        # path.resolve() may differ from working_dir.resolve() due to symlinks,
+        # but path.is_relative_to(working_dir) handles both absolute and
+        # symlinked paths correctly on Python 3.9+.
+        try:
+            if not path.is_relative_to(self.working_dir):
+                return False
+        except (OSError, ValueError):
+            # Older Python or path resolution error — fall back to parent
+            # check as a best-effort safeguard.
+            if not _is_ancestor_or_same(self.working_dir, path):
+                return False
         return True
 
     def _load_hints_for_directory(self, directory: Path) -> Optional[str]:
-        """Load hint files from a directory. Returns formatted text or None."""
-        cache_key = (str(directory), str(self.working_dir))
-        if cache_key in _hint_cache:
-            cached = _hint_cache[cache_key]
-            if cached is not None:
-                self._loaded_dirs.add(directory)
-            return cached
+        """Load hint files from a directory. Returns formatted text or None.
 
+        Only loads hints from directories within the working directory tree.
+        """
         self._loaded_dirs.add(directory)
+
+        # Reject paths outside the working directory tree.
+        try:
+            if not directory.is_relative_to(self.working_dir):
+                logger.debug(
+                    "Skipping hint files in %s — outside working_dir %s",
+                    directory, self.working_dir,
+                )
+                return None
+        except (OSError, ValueError):
+            if not _is_ancestor_or_same(self.working_dir, directory):
+                logger.debug(
+                    "Skipping hint files in %s — outside working_dir %s",
+                    directory, self.working_dir,
+                )
+                return None
 
         found_hints = []
         for filename in _HINT_FILENAMES:
@@ -218,7 +254,6 @@ class SubdirectoryHintTracker:
                 logger.debug("Could not read %s: %s", hint_path, exc)
 
         if not found_hints:
-            _hint_cache[cache_key] = None
             return None
 
         sections = []
@@ -227,11 +262,9 @@ class SubdirectoryHintTracker:
                 f"[Subdirectory context discovered: {rel_path}]\n{content}"
             )
 
-        result = "\n\n".join(sections)
-        _hint_cache[cache_key] = result
         logger.debug(
             "Loaded subdirectory hints from %s: %s",
             directory,
             [h[0] for h in found_hints],
         )
-        return result
+        return "\n\n".join(sections)

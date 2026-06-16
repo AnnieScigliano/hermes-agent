@@ -27,6 +27,10 @@ import aiohttp
 from aiohttp import WSMsgType
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.daemoncraft_antiloop import StuckPivotTracker
+from gateway.platforms.daemoncraft_narrategate import (
+    NarrateGateTracker,
+)
 
 # ---------------------------------------------------------------------------
 # CycleDetector — ported from daemoncraft agents/safety.py (stdlib-only)
@@ -136,6 +140,26 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         self._plan_gc_timeout: int = (config.extra or {}).get("plan_gc_timeout_seconds", 300)
         self._turn_counter: int = 0  # Sequential turn counter for agent logs
         self._last_idle_wake_up: float = 0.0  # Throttle idle wake-ups
+        self._task_signature_history: list = []  # Anti-loop watchdog: last N (action,status) tuples
+        self._task_loop_threshold: int = (config.extra or {}).get("task_loop_threshold", 4)
+        self._task_stale_seconds: int = (config.extra or {}).get("task_stale_seconds", 600)
+        # StuckPivotTracker: detect same-objective / no-progress thrash using
+        # judge verdicts + position. Threshold + bucket size are config-tunable.
+        self._stuck_pivot_tracker = StuckPivotTracker(
+            threshold=(config.extra or {}).get("stuck_pivot_threshold", 3),
+            bucket_size=(config.extra or {}).get("spatial_bucket_blocks", 5),
+            cooldown_seconds=(config.extra or {}).get("stuck_pivot_cooldown_seconds", 120.0),
+        )
+        # NarrateGateTracker: detect when the L4 narrates a past-tense action
+        # that contradicts the most recent mc_* tool result. Records every tool
+        # result so the gateway can check the LLM's next assistant text against
+        # the verified tool outcome. Part of Opción B for t_0fa2c6dc.
+        self._narrate_gate_tracker = NarrateGateTracker(
+            reminder_cooldown_seconds=(config.extra or {}).get(
+                "narrate_reminder_cooldown_seconds", 30.0,
+            ),
+        )
+        self._session_epoch: int = int(time.time() * 1_000_000)  # microsecond resolution — practically zero collision risk between gateway restarts
 
         # Load allowlist by UUID (preferred) or username fallback.
         raw_allow = os.getenv("DAEMONCRAFT_ALLOWED_USERS", "").strip()
@@ -157,6 +181,56 @@ class DaemonCraftAdapter(BasePlatformAdapter):
             chat_id.startswith(w + ":") for w in self._world_names
         )
 
+    def invoke_hook(self, hook_name: str, **kwargs):
+        """Wrapper around the hermes_cli.plugins invoke_hook helper.
+
+        The plugin system is hermes-cli-internal; this adapter sits
+        above the LLM loop and shouldn't import from hermes_cli
+        directly at module top (avoids a circular import when
+        hermes-cli imports back from the gateway package during
+        tests). We do a lazy import here.
+        """
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            return _invoke_hook(hook_name, **kwargs)
+        except Exception as _he:
+            logging.debug(f"invoke_hook({hook_name}) failed: {_he}")
+            return iter(())
+
+    def _write_event_to_queue(self, event: dict) -> None:
+        """Write an event to the daemoncraft-events.jsonl bridge file.
+        
+        The agent_loop reads this file each tick and includes events in the
+        context stream, which the CLI can observe.
+        """
+        try:
+            # Match agent_loop's path: ~/.hermes/sessions/<BOT_USERNAME>-events.jsonl
+            bot_user = (os.getenv("MC_USERNAME") or self._bot_username or "CompAII")
+            queue_path = Path.home() / ".hermes" / "sessions" / f"{bot_user}-events.jsonl"
+            queue_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(queue_path, "a") as f:
+                f.write(json.dumps(event) + "\n")
+        except Exception as e:
+            logger.warning("[DaemonCraft] Failed to write event to queue: %s", e)
+
+    async def _is_lab_mode(self) -> bool:
+        """Check if the bot is in lab mode (explicit, not automagic).
+        
+        In lab mode, the gateway never spawns agent turns. All events
+        (chat, heartbeats) only add context to the stream file.
+        """
+        try:
+            async with self._session.get(
+                f"{self._bot_api_url}/controller/mode", timeout=aiohttp.ClientTimeout(total=3)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    mode_data = data.get("data") if data.get("ok") else {}
+                    return mode_data.get("mode") == "lab"
+        except Exception:
+            pass
+        return False
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -172,6 +246,33 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         self._last_seen_timestamp = int(time.time() * 1000)
         self._shutdown_event.clear()
         self._session = aiohttp.ClientSession()
+        # Cache the controller mode at connect() so the heartbeat
+        # classifier can short-circuit without an HTTP roundtrip on
+        # every heartbeat. Updated whenever the user toggles mode
+        # via /controller/mode.
+        # Set initial value to 0.0 so the FIRST heartbeat forces a
+        # refresh (the 5s threshold check would otherwise trust the
+        # stale "autonomous" default for up to 5s after a bot server
+        # that's slow to start).
+        self._last_mode_check = 0.0
+        self._controller_mode_cache = "autonomous"  # safe default
+        try:
+            async with self._session.get(
+                f"{self._bot_api_url}/controller/mode",
+                timeout=aiohttp.ClientTimeout(total=2.0),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("ok"):
+                        self._controller_mode_cache = data.get("data", {}).get("mode", "autonomous")
+                        logger.info("[DaemonCraft] controller_mode at connect: %s", self._controller_mode_cache)
+                else:
+                    logger.warning("[DaemonCraft] controller_mode fetch returned status %d at connect; "
+                                   "defaulting to '%s' (will refresh on first heartbeat)",
+                                   resp.status, self._controller_mode_cache)
+        except Exception as _ce:
+            logger.warning("[DaemonCraft] controller_mode fetch failed at connect: %s; defaulting to '%s' "
+                           "(will refresh on first heartbeat)", _ce, self._controller_mode_cache)
 
         n = int(os.getenv("MC_CYCLE_N", "0"))
         window = int(os.getenv("MC_CYCLE_WINDOW", "20"))
@@ -205,13 +306,46 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         Sets the bot_api_url context variable so that any tools (today:
         embodied_plan; previously: minecraft/altercraft) dispatched for
         this message target the correct bot server.
+
+        In lab mode, strip the re-entry "[System note: ...]" prefix that the
+        gateway prepends when restoring a session after a crash. The note would
+        otherwise wake the L4 with a turn containing only the previous state
+        summary, which is exactly the "no-op narration" pattern we want to
+        avoid in lab. Autonomous mode keeps the note (it's useful for
+        continuity when the L4 is meant to keep acting).
         """
         from tools.bot_api_url_ctx import set_bot_api_url, reset_bot_api_url
+        if event.text and await self._is_lab_mode():
+            stripped = self._strip_reentry_note(event.text)
+            if stripped != event.text:
+                logger.info(
+                    "[DaemonCraft] Stripped re-entry note in lab mode "
+                    "(%d → %d chars)",
+                    len(event.text), len(stripped),
+                )
+                event.text = stripped
         token = set_bot_api_url(self._bot_api_url)
         try:
             await super().handle_message(event)
         finally:
             reset_bot_api_url(token)
+
+    @staticmethod
+    def _strip_reentry_note(text: str) -> str:
+        """Remove the leading `[System note: ...]\n\n` block that gateway/run.py
+        prepends on session restore. Idempotent: if the text does not start
+        with that block, returns it unchanged.
+        """
+        import re
+        if not text.startswith("[System note:"):
+            return text
+        return re.sub(
+            r"^\[System note:.*?\]\s*\n\n",
+            "",
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
 
     # ------------------------------------------------------------------
     # WebSocket listener
@@ -367,6 +501,40 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[DaemonCraft] /agent/interrupt exception: %s", e)
 
+    async def _force_pivot_interrupt(self, pivot_reason: str) -> None:
+        """Abort the L4's stuck turn and queue a pivot directive as a system
+        message. The system message is constructed so that it survives the
+        re-entry note filter (it's not a [System note: ...] prefix) and the
+        /-command filter (it doesn't start with /). The L4 receives the
+        directive at the start of its next turn and must radically change
+        category of action.
+        """
+        # 1. Abort the in-progress LLM turn via the bot server interrupt endpoint.
+        await self._interrupt_agent(pivot_reason)
+
+        # 2. Reset the tracker so the next turn starts fresh.
+        self._stuck_pivot_tracker.reset_turn()
+
+        # 3. Inject the pivot directive as a system message into the L4.
+        # Mirrors the pattern used by plan_cancelled at line ~595.
+        source = self.build_source(
+            chat_id=self._group_chat_id(),
+            chat_name="world",
+            chat_type="group",
+            user_id="system",
+            user_name="System",
+            thread_id="world",
+        )
+        source.profile = self._profile
+        event = MessageEvent(
+            text=f"[Pivot directive] {pivot_reason}",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"pivot_reason": pivot_reason, "type": "stuck_pivot"},
+            internal=True,
+        )
+        await self.handle_message(event)
+
     async def _handle_quest_event(self, data: dict) -> None:
         """Process a quest_event from the QuestEngine.
 
@@ -443,10 +611,183 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         await self.handle_message(event)
 
     async def _handle_action_result(self, payload: dict) -> None:
-        """Forward action_result events to transform_tool_result hooks."""
+        """Forward action_result events to transform_tool_result hooks.
+
+        Also record the result in the NarrateGateTracker so the next
+        assistant message can be checked for past-tense narration that
+        contradicts the verified tool outcome. Tied to t_a2c3facb:
+        consumes the typed outcome/category fields directly (not strings).
+
+        t_f8481d90: ALSO augment the narration verification with a
+        synthetic world state injection that includes a visual pre-process
+        of the area affected by the action. This is the "soft discard"
+        — we don't strip the assistant text from history, but we give
+        the LLM a strong anchor (the visual) for re-narrating correctly
+        on the next turn.
+        """
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        action_name = str(data.get("action") or "")
+        # TYPED fields from the server (see agents/bot/lib/typed_result.js).
+        # No string matching on result blobs.
+        outcome = str(data.get("outcome") or "unknown")
+        category = str(data.get("category") or "other")
+        target = data.get("target")
+        position_before = data.get("position_before")
+        position_after = data.get("position_after")
+        # Forward the original payload to the transform_tool_result hook
+        # for any consumer that wants the full record (judge, ok, ts, etc.)
         import json as _json
-        result_str = _json.dumps(payload)
-        await self.invoke_hook("transform_tool_result", tool_name="mc_action_result", result=result_str)
+        result_str = _json.dumps(data)
+        # Tied to t_f8481d90: invoke_hook returns a sync iterator, not
+        # awaitable. Just iterate it (transform_tool_result is a
+        # fire-and-forget observer hook).
+        for _ in self.invoke_hook("transform_tool_result", tool_name="mc_action_result", result=result_str):
+            pass
+
+        # NarrateGateTracker: capture this tool result with the typed fields.
+        # No substring matching, no heuristic classification. The server
+        # emits the outcome and category at the top level.
+        pos_before = None
+        pos_after = None
+        try:
+            pos_before = (
+                (position_before.get("x"), position_before.get("y"), position_before.get("z"))
+                if isinstance(position_before, dict) else None
+            )
+            pos_after = (
+                (position_after.get("x"), position_after.get("y"), position_after.get("z"))
+                if isinstance(position_after, dict) else None
+            )
+            self._narrate_gate_tracker.record_tool_result(
+                tool_name=action_name or "mc_action",
+                outcome=outcome,
+                action_category=category,
+                position_before=pos_before,
+                position_after=pos_after,
+                now=time.time(),
+            )
+        except Exception as _ng_err:
+            logging.debug(f"NarrateGateTracker record failed: {_ng_err}")
+
+        # t_f8481d90: build the visual-augmented narrate reminder.
+        # If the last assistant message had past-tense narration that
+        # contradicts this tool result, inject a synthetic world state
+        # with the visual pre-process of the affected area. Cap at 2
+        # injections per turn to avoid infinite loops.
+        try:
+            last_assistant_text = await self._get_last_assistant_text()
+            if last_assistant_text:
+                mismatch = self._narrate_gate_tracker.detect_narrate_mismatch(
+                    last_assistant_text, now=time.time()
+                )
+                if mismatch and self._narrate_gate_tracker.should_inject_reminder(mismatch, now=time.time()):
+                    await self._inject_narrate_mismatch_visual(
+                        mismatch=mismatch,
+                        action_name=action_name,
+                        category=category,
+                        target=target,
+                        position_after=position_after,
+                        last_assistant_text=last_assistant_text,
+                    )
+        except Exception as _v_err:
+            logging.debug(f"Narrate visual inject failed: {_v_err}")
+
+    async def _get_last_assistant_text(self) -> str:
+        """Return the most recent assistant text from the world session.
+
+        Used by t_f8481d90 (discard narrate) to compare narration
+        against the verified tool result.
+        """
+        if not self._session_store:
+            return ""
+        session_id = self._get_world_session_id()
+        if not session_id:
+            return ""
+        try:
+            transcript = self._session_store.load_transcript(session_id)
+            for msg in reversed(transcript):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        text_parts = [b.get("text", "") for b in content if b.get("type") == "text"]
+                        return "\n".join(text_parts).strip()
+                    return str(content or "").strip()
+        except Exception:
+            pass
+        return ""
+
+    async def _inject_narrate_mismatch_visual(
+        self,
+        mismatch,
+        action_name: str,
+        category: str,
+        target,
+        position_after,
+        last_assistant_text: str,
+    ) -> None:
+        """Inject a synthetic world state that includes a visual pre-process
+        of the area affected by the action, plus an explicit reminder.
+
+        Tied to t_f8481d90 (discard narrate + visual inject). This is
+        the "soft discard": we don't strip the assistant text from
+        history, but we give the LLM a strong anchor (the visual) for
+        re-narrating correctly on the next turn. The reminder text
+        names the specific narration that contradicted the tool result
+        and tells the LLM to anchor to the visual.
+        """
+        # Fetch a visual of the affected area. For movement, it's the
+        # bot's current position. For build, it's the target cell. For
+        # mine, the target cell.
+        visual_block = ""
+        try:
+            if (position_after and isinstance(position_after, dict)
+                    and self._session is not None):
+                bx, by, bz = (
+                    int(position_after.get("x", 0)),
+                    int(position_after.get("y", 0)),
+                    int(position_after.get("z", 0)),
+                )
+                radius = 4
+                url = (
+                    f"{self._bot_api_url}/blocks"
+                    f"?x1={bx-radius}&y1={by-radius}&z1={bz-radius}"
+                    f"&x2={bx+radius}&y2={by+radius}&z2={bz+radius}"
+                    f"&format=visual"
+                )
+                async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        body = await resp.json()
+                        visual_block = (body.get("data") or {}).get("text", "") or ""
+                        if len(visual_block) > 2500:
+                            visual_block = visual_block[:2500] + "\n...[truncated]"
+        except Exception as _v_err:
+            logging.debug(f"Failed to fetch visual for narrate mismatch: {_v_err}")
+            visual_block = "(visual fetch failed)"
+
+        reminder_text = (
+            f"[Verify-Before-Narrate] Your last narration said "
+            f"'{mismatch.snippet}' but the most recent tool result "
+            f"({action_name}) had outcome '{mismatch.actual_outcome}'. "
+            f"The narration contradicts the verified tool result. "
+            f"Below is the visual pre-process of the affected area "
+            f"(radius 4 around the bot). Anchor your next narration "
+            f"to this visual, not to your earlier intention. The visual "
+            f"is the ground truth."
+        )
+        data = {
+            "kind": "narrate_mismatch_visual",
+            "reminder": reminder_text,
+            "tool_name": action_name,
+            "category": category,
+            "outcome": mismatch.actual_outcome,
+            "target": target,
+            "position_after": position_after,
+            "visual": visual_block,
+            "snippet": mismatch.snippet,
+            "mismatch_kind": mismatch.kind,
+            "ts": time.time(),
+        }
+        await self._inject_synthetic_world_state(data)
 
     async def _handle_heartbeat_context(self, data: dict) -> None:
         """Process heartbeat_context with two-level event architecture.
@@ -458,11 +799,56 @@ class DaemonCraftAdapter(BasePlatformAdapter):
           tool_choice="required". The agent MUST react with a tool call (or mc_no_op).
         - Active plans: every heartbeat while a plan is active forces a wake_up so
           the agent evaluates progress against the plan.
+        - L4 verdict (GAP #5): body_session.l4_verdict is formatted into prompt as
+          compact "[L4 last] ..." feedback line (observations+delta only, no prescription).
+
+        In lab mode, drop heartbeats entirely. We don't update plan tracking, we
+        don't poll the watchdog, and we don't create the L4 session in the
+        session_store. The session is only created when a real user turn arrives
+        (chat message, dashboard event, or explicit /command from the operator).
+        This keeps lab mode truly dormant between operator actions.
         """
+        if await self._is_lab_mode():
+            return
+
+        # StuckPivotTracker: detect same-objective / no-progress thrash and
+        # interrupt the active L4 turn with a pivot message. Only fires in
+        # autonomous mode (lab already returned above). Runs on every
+        # heartbeat — cheap O(1) state update.
+        body_session = data.get("body_session") or {}
+        status = data.get("status") or {}
+        pending_judges = body_session.get("pending_judges") or []
+        pivot_reason = self._stuck_pivot_tracker.record_heartbeat(
+            body_session=body_session,
+            status=status,
+            pending_judges=pending_judges,
+            now=time.time(),
+        )
+        if pivot_reason:
+            logger.warning("[DaemonCraft] Stuck pivot triggered: %s", pivot_reason)
+            await self._force_pivot_interrupt(pivot_reason)
+
         plan = data.get("plan") or {}
         await self._update_plan_tracking(plan)
 
-        # Run plan garbage collection before classification
+        # Run plan garbage collection before classification.
+        # Tied to t_97b030a6 followup: in lab mode, plan GC is
+        # silenced too. The plan is just a record; lab mode means
+        # Nico is observing and not driving the bot, so a stale
+        # plan should not fire events. Without this guard, the
+        # auto-resumed session's stale plan GC'd and re-fired the
+        # L4 in a loop (52 API calls, 14 min, 0 user input).
+        if await self._is_lab_mode():
+            # In lab mode, also clear any active plan so the L4
+            # has no reference to the dead auto-resume plan.
+            if self._plan_goal is not None:
+                logger.info("[DaemonCraft] Lab mode: clearing stale plan '%s' on heartbeat", self._plan_goal[:40])
+                self._plan_goal = None
+                self._plan_tasks_snapshot = []
+                self._plan_created_at = 0.0
+                self._plan_last_progress_at = 0.0
+            # Drop the heartbeat entirely.
+            return
         gc_reason = await self._maybe_gc_plan()
         if gc_reason:
             logger.info("[DaemonCraft] Plan GC: %s", gc_reason)
@@ -488,19 +874,23 @@ class DaemonCraftAdapter(BasePlatformAdapter):
                 source=source,
                 raw_message={"gc_reason": gc_reason},
                 internal=True,
-                tool_choice="required",
-            )
+                )
             await self.handle_message(event)
             return
 
-        event_type = self._classify_heartbeat_event(data)
+        event_type = await self._classify_heartbeat_event(data)
         logger.info("[DaemonCraft] Heartbeat classified as: %s", event_type)
 
-        # Inject world state from the body (Gemma-Andy) instead of raw bot data
-        await self._inject_embodied_world_state(data)
+        # World-state injection REMOVED — was flooding gAndy with scans every heartbeat,
+        # interrupting McCompaii's own embodied_plan calls. L4 scans when HE decides.
 
         if event_type == "context":
             logger.debug("[DaemonCraft] Context-only heartbeat injected silently")
+            return
+
+        # Skip wake_up if there's an active user session — single controller
+        if await self._is_lab_mode():
+            logger.info("[DaemonCraft] Skipping wake_up: active user session detected")
             return
 
         # Cycle guard — skip wake-up if loop is repeating embodied_plan calls
@@ -509,15 +899,89 @@ class DaemonCraftAdapter(BasePlatformAdapter):
 
         # Wake-up event: force an agent turn with tool_choice=required
         plan_goal = self._plan_goal
-        if plan_goal and event_type == "wake_up":
-            prompt_text = (
-                f"[System: Evaluate progress on plan '{plan_goal}'. "
-                f"Current tasks: {len(self._plan_tasks_snapshot)}. "
-                f"Use mc_plan(action='get_plan') to review, mc_plan(action='update_task') to mark progress, "
-                f"or other tools to advance the active task.]"
-            )
+        body = data.get("body_session") or {}
+
+        # Build enriched prompt from body_session
+        prompt_parts = []
+
+        # Header: trigger + classification
+        reason = body.get("heartbeat_reason", "unknown")
+        if reason and reason != "idle":
+            prompt_parts.append(f"[System: Body heartbeat — WAKE UP. Trigger: {reason}.")
         else:
-            prompt_text = "[System: React to the perceptual update above using available tools.]"
+            prompt_parts.append("[System: Body heartbeat — IDLE wake up.")
+
+        # Body status — position only. Survival is L2's job, never L4's concern.
+        pos = body.get("position", {})
+        pos_str = f"({pos.get('x', '?')}, {pos.get('y', '?')}, {pos.get('z', '?')})" if pos else "unknown"
+        prompt_parts.append(f" Body: {pos_str}. Your body handles survival automatically — you explore, document, build.\n")
+        prompt_parts.append(" Nico is a spectator watching your stream. You are alone in this world. Never wait for him, never go to him, never change plans for him. If he wants something he'll say it in chat. Until then: explore, build paths, document places. You are the protagonist. Act.\n")
+        # Body activity — narrative continuity, NOT a problem to solve. L2 fought? Fine. L2 ate? Fine.
+        # This is for your story when you chat with humans. Never plan around it. Your body already handled it.
+        body_act = (body.get("body_activity") or "").strip()
+        if body_act:
+            prompt_parts.append(f" [Info] Your body handled: {body_act}. Everything is fine — you focus on exploring.\n")
+
+        # GAP #5: L4 last-action verdict (from judge) — injected into NEXT heartbeat only.
+        # Reports WHAT happened (outcome + delta), never prescribes next action (LLM must reason).
+        # Combines with L2 runner activity during the open-loop window for context.
+        l4v = body.get("l4_verdict")
+        if l4v and isinstance(l4v, dict):
+            l2_sum = (body.get("runner_activity") or {}).get("summary") or ""
+            l2_part = f" | L2: {l2_sum}" if l2_sum else ""
+            ago = l4v.get("seconds_ago", 0)
+            delta = l4v.get("delta", "0.0m")
+            rc = l4v.get("reason_code") or ""
+            outcome = l4v.get("outcome") or "?"
+            act = l4v.get("action") or "?"
+            # Compact one-line report; example: [L4 last] dig@540,115,-307: preempted RUNNER_ACTIVE delta=0.0m 14s ago | L2: 2 attacks, 1 flee
+            verdict_line = f"[L4 last] {act}: {outcome} {rc} delta={delta} {ago}s ago{l2_part}".strip()
+            prompt_parts.append(f" {verdict_line}.")
+
+
+
+        # Action history (oldest -> newest)
+        actions = body.get("action_history") or []
+        if actions:
+            a_strs = [f"{a.get('action', '?')}({a.get('status', '?')}, {a.get('secondsAgo', '?')}s ago)" for a in actions]
+            prompt_parts.append(f" Recent actions: {' -> '.join(a_strs)}.")
+
+        # Active task
+        task_mode = body.get("mode", "idle")
+        last_action = body.get("last_action")
+        if last_action and task_mode not in ("idle", None):
+            prompt_parts.append(f" Active task: {last_action} ({task_mode}).")
+        else:
+            prompt_parts.append(" Active task: none.")
+
+        # Plan context
+        if plan_goal:
+            prompt_parts.append(f" Plan: '{plan_goal}' — {len(self._plan_tasks_snapshot)} tasks.")
+            prompt_parts.append(" Evaluate progress based on the provided wake up event data. Continue, adjust, or wait.]")
+        else:
+            prompt_parts.append(" No active plan. START following your autonomous curriculum immediately. Take ONE concrete action now: gather, craft, build, or explore. Do not wait.]")
+
+        prompt_text = "".join(prompt_parts)
+
+        # Store for dashboard Bot Mind panel
+        self._last_prompt = prompt_text
+
+        # Auto-consume pending judges before dispatching to L4
+        pending_judges = body.get("pending_judges") or []
+        if pending_judges and self._session:
+            try:
+                l4_ticks = [j["captured_at_tick"] for j in pending_judges if j.get("initiator") == "l4_agent"]
+                if l4_ticks:
+                    async with self._session.post(
+                        f"{self._bot_api_url}/judge/consume",
+                        json={"ticks": l4_ticks},
+                        timeout=aiohttp.ClientTimeout(total=3),
+                    ) as resp:
+                        result = await resp.json()
+                        logger.debug("[DaemonCraft] Consumed %d judge entries, %d remaining",
+                                     result.get("consumed", 0), result.get("remaining", 0))
+            except Exception:
+                pass
 
         source = self.build_source(
             chat_id=self._group_chat_id(),
@@ -535,7 +999,6 @@ class DaemonCraftAdapter(BasePlatformAdapter):
             source=source,
             raw_message=data,
             internal=True,
-            tool_choice="required",
         )
         await self.handle_message(event)
 
@@ -611,7 +1074,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
 
         return None
 
-    def _classify_heartbeat_event(self, data: dict) -> str:
+    async def _classify_heartbeat_event(self, data: dict) -> str:
         """Classify heartbeat as 'context' or 'wake_up'.
 
         Wake-up triggers:
@@ -620,7 +1083,47 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         - Health decreased from previous known value
         - Nearby hostile entities (zombie, skeleton, creeper, spider)
         - Explicit damage events in events list
+
+        In lab mode, NO wake_up triggers fire. Lab mode means: the
+        agent only acts on user input. Heartbeats add to context but
+        do not spawn agent turns. This is so the human operator has
+        full control during testing.
         """
+        # Lab mode silences ALL wake_up triggers. Only user input
+        # (chat message) drives the L4. Tied to t_97b030a6 followup.
+        # The check below is async because we need a HTTP roundtrip
+        # to /controller/mode (the mode is in the bot server's memory
+        # and may have changed since connect()). Cached for 5s.
+        # FAIL-SAFE: if the fetch fails, assume lab mode. This is
+        # because the alternative (stale "autonomous" cache) caused
+        # a 52-API-call loop on 2026-06-02. Better to miss a wake-up
+        # in autonomous mode than to fire one in lab mode.
+        now = time.time()
+        if (now - getattr(self, "_last_mode_check", 0)) > 5.0:
+            self._last_mode_check = now
+            try:
+                async with self._session.get(
+                    f"{self._bot_api_url}/controller/mode",
+                    timeout=aiohttp.ClientTimeout(total=1.0),
+                ) as resp:
+                    if resp.status == 200:
+                        md = await resp.json()
+                        if md.get("ok"):
+                            actual = md.get("data", {}).get("mode", "lab")
+                            self._controller_mode_cache = actual
+                        else:
+                            # ok=false means error, assume lab
+                            self._controller_mode_cache = "lab"
+                    else:
+                        # HTTP error, assume lab
+                        self._controller_mode_cache = "lab"
+            except Exception:
+                # Connection error, timeout, anything — assume lab
+                # (safer than assuming autonomous)
+                self._controller_mode_cache = "lab"
+        if getattr(self, "_controller_mode_cache", None) == "lab":
+            return "context"
+
         status = data.get("status") or {}
         nearby = data.get("nearby") or {}
         events = data.get("events") or []
@@ -654,6 +1157,18 @@ class DaemonCraftAdapter(BasePlatformAdapter):
                 logger.info("[DaemonCraft] Wake-up reason: damage event '%s'", ev_str[:80])
                 return "wake_up"
 
+        # Death detected — force immediate wake-up so agent can react
+        body = data.get("body_session") or {}
+        current_deaths = body.get("deaths", 0)
+        if current_deaths > getattr(self, "_last_deaths", 0):
+            self._last_deaths = current_deaths
+            last = body.get("last_death") or {}
+            pos = last.get("position", {})
+            logger.info("[DaemonCraft] Wake-up reason: death #%d at (%.1f, %.1f, %.1f)",
+                        current_deaths, pos.get("x", 0), pos.get("y", 0), pos.get("z", 0))
+            return "wake_up"
+        self._last_deaths = current_deaths
+
         # Nearby hostile mobs
         hostile = {"zombie", "skeleton", "creeper", "spider", "enderman", "witch", "husk", "drowned", "phantom"}
         for ent in nearby.get("entities", [])[:12]:
@@ -667,6 +1182,35 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         if task and task.get("status") == "stuck":
             logger.info("[DaemonCraft] Wake-up reason: bot stuck (%s)", task.get("error", "unknown")[:60])
             return "wake_up"
+
+        # Anti-loop watchdog: same task signature across N heartbeats = stuck in a loop.
+        # The L4 may keep choosing the same action (e.g. deathpoint, mine, goto) without
+        # changing the world. We force a wake-up with an explicit loop message so the
+        # agent sees "you've been doing X for N heartbeats, pivot."
+        if task:
+            action = task.get("action", "")
+            tstatus = task.get("status", "")
+            elapsed = int(task.get("elapsed_s", 0) or 0)
+            signature = (action, tstatus, elapsed // 30)  # bucket elapsed by 30s
+            self._task_signature_history.append(signature)
+            if len(self._task_signature_history) > self._task_loop_threshold * 2:
+                self._task_signature_history = self._task_signature_history[-self._task_loop_threshold * 2:]
+            # Stale task: status="done" but elapsed_s huge = L4 is not acting on results
+            if tstatus == "done" and elapsed > self._task_stale_seconds:
+                logger.info(
+                    "[DaemonCraft] Wake-up reason: stale task '%s' done for %ds (>%ds threshold)",
+                    action, elapsed, self._task_stale_seconds,
+                )
+                return "wake_up"
+            # Repeated signature: same action+status (bucketed) for N consecutive heartbeats
+            if len(self._task_signature_history) >= self._task_loop_threshold:
+                recent = self._task_signature_history[-self._task_loop_threshold:]
+                if len(set(recent)) == 1:
+                    logger.warning(
+                        "[DaemonCraft] Wake-up reason: TASK LOOP detected — %s/%s repeated for %d heartbeats",
+                        action, tstatus, self._task_loop_threshold,
+                    )
+                    return "wake_up"
 
         # Idle heartbeat: wake up Steve so he can act autonomously
         # (progress on achievements, scout, etc.) Throttle to avoid token spam.
@@ -844,7 +1388,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
             platform=Platform.DAEMONCRAFT,
             chat_id=self._group_chat_id(),
             chat_type="group",
-            user_id=self._bot_username,
+            user_id=f"{self._bot_username}:{self._session_epoch}",  # epoch prevents stale session reuse
             thread_id="world",
         )
         session_key = build_session_key(
@@ -881,6 +1425,27 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         if not text:
             return
 
+        # Filter: any message that starts with "/" is a Minecraft server command
+        # (e.g. "/gamemode creative", "/tp", "/time set day"). These are operator
+        # instructions, not agent prompts — they must not be injected into the L4
+        # session as a chat turn, otherwise the L4 reads them as user intents and
+        # acts. If we want to tell the L4 something about a command, we do it in
+        # natural language, not as a slash-command.
+        stripped = text.lstrip()
+        if stripped.startswith("/"):
+            logger.info(
+                "[DaemonCraft] Filtered /-command from %s (not injected to L4): %r",
+                from_, stripped[:80],
+            )
+            self._write_event_to_queue({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "src": "gateway",
+                "event": "filtered_command",
+                "player": from_,
+                "text": stripped,
+            })
+            return
+
         is_whisper = entry.get("whisper", False)
         is_private = entry.get("private", False)
         world = entry.get("world", "world")
@@ -908,11 +1473,27 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         )
         source.profile = self._profile
 
+        # Always inject chat into the world session so autonomous McCompaii sees it.
+        # When lab mode is active (human controls via CLI), mark internal to suppress
+        # auto-response — the CLI session handles the reply. Still write to event queue
+        # for the CLI bridge so it can pick up the message text.
+        lab = await self._is_lab_mode()
+        if lab:
+            logger.info("[DaemonCraft] Chat from %s injected to world session (lab mode — no auto-response)", from_)
+            self._write_event_to_queue({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "src": "gateway",
+                "event": "chat",
+                "player": from_,
+                "text": text,
+            })
+
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=entry,
+            internal=lab,  # suppress auto-response when human is driving
         )
 
         await self.handle_message(event)
@@ -986,12 +1567,20 @@ class DaemonCraftAdapter(BasePlatformAdapter):
                 json={
                     "turn": len(transcript),
                     "time": int(time.time() * 1000),
-                    "prompt": "",  # omit — transcript is large; response + tools is what the panel needs
+                    "prompt": "",
                     "response": last_assistant or "",
                     "tool_calls": tool_calls,
                     "error": None,
                 },
             )
+
+            # Write LLM response to event bridge so agent_loop can display it
+            self._write_event_to_queue({
+                "type": "agent_response",
+                "text": last_assistant or "",
+                "tool_calls": [tc.get("name", "?") for tc in tool_calls],
+                "ts": int(time.time() * 1000),
+            })
         except Exception as e:
             logger.debug("[DaemonCraft] on_processing_complete /agent/log post failed: %s", e)
 
@@ -1094,7 +1683,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e), retryable=True)
 
         # DC-123: relay TTS to dashboard after successful outbound message.
-        system_tts_skip = {"steer", "gateway shutting down", "synthetic mc_perceive", "heartbeat", "mc_perceive"}
+        system_tts_skip = {"steer", "gateway shutting down", "synthetic mc_perceive", "heartbeat", "mc_perceive", "queued", "⏳"}
         is_system_msg = any(skip in content.lower() for skip in system_tts_skip)
         if (content and content.strip() not in ("PASS", "")
                 and not is_system_msg
