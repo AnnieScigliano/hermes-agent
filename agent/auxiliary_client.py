@@ -1966,7 +1966,8 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                     return GeminiNativeClient(api_key=api_key, base_url=base_url), model
             extra = {}
             if base_url_host_matches(base_url, "api.kimi.com"):
-                extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+                from hermes_cli.auth import kimi_coding_default_headers
+                extra["default_headers"] = kimi_coding_default_headers()
             elif base_url_host_matches(base_url, "githubcopilot.com"):
                 from hermes_cli.models import copilot_default_headers
 
@@ -2006,7 +2007,8 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                 return GeminiNativeClient(api_key=api_key, base_url=base_url), model
         extra = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
-            extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+            from hermes_cli.auth import kimi_coding_default_headers
+            extra["default_headers"] = kimi_coding_default_headers()
         elif base_url_host_matches(base_url, "githubcopilot.com"):
             from hermes_cli.models import copilot_default_headers
 
@@ -3663,6 +3665,17 @@ def _refresh_provider_credentials(provider: str) -> bool:
                 return False
             _evict_cached_clients(normalized)
             return True
+        if normalized in ("kimi-coding", "kimi-coding-cn"):
+            from hermes_cli.auth import resolve_kimi_coding_runtime_credentials
+
+            creds = resolve_kimi_coding_runtime_credentials(
+                force_refresh=True,
+                allow_api_key_fallback=True,
+            )
+            if not str(creds.get("api_key", "") or "").strip():
+                return False
+            _evict_cached_clients(normalized)
+            return True
     except Exception as exc:
         logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
         return False
@@ -4507,7 +4520,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
             is_agent_turn=True, is_vision=is_vision
         )
     elif base_url_host_matches(sync_base_url, "api.kimi.com"):
-        async_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+        from hermes_cli.auth import kimi_coding_default_headers
+        async_kwargs["default_headers"] = kimi_coding_default_headers()
     elif base_url_host_matches(sync_base_url, "integrate.api.nvidia.com"):
         async_kwargs["default_headers"] = build_nvidia_nim_headers(sync_base_url)
     else:
@@ -4828,7 +4842,8 @@ def resolve_provider_client(
             if _dq:
                 extra["default_query"] = _dq
             if base_url_host_matches(custom_base, "api.kimi.com"):
-                extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+                from hermes_cli.auth import kimi_coding_default_headers
+                extra["default_headers"] = kimi_coding_default_headers()
             elif base_url_host_matches(custom_base, "githubcopilot.com"):
                 from hermes_cli.copilot_auth import copilot_request_headers
                 extra["default_headers"] = copilot_request_headers(
@@ -5085,7 +5100,8 @@ def resolve_provider_client(
         # Provider-specific headers
         headers = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
-            headers["User-Agent"] = "claude-code/0.1.0"
+            from hermes_cli.auth import kimi_coding_default_headers
+            headers = kimi_coding_default_headers()
         elif base_url_host_matches(base_url, "githubcopilot.com"):
             from hermes_cli.copilot_auth import copilot_request_headers
 
