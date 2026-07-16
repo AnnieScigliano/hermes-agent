@@ -164,6 +164,7 @@ export interface UiState {
   compact: boolean
   detailsMode: DetailsMode
   detailsModeCommandOverride: boolean
+  historyNavRequiresEmptyInput: boolean
   info: null | SessionInfo
   liveSessionCount: number
   inlineDiffs: boolean
