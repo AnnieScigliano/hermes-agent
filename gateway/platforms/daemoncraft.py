@@ -915,7 +915,6 @@ class DaemonCraftAdapter(BasePlatformAdapter):
         pos = body.get("position", {})
         pos_str = f"({pos.get('x', '?')}, {pos.get('y', '?')}, {pos.get('z', '?')})" if pos else "unknown"
         prompt_parts.append(f" Body: {pos_str}. Your body handles survival automatically — you explore, document, build.\n")
-        prompt_parts.append(" Nico is a spectator watching your stream. You are alone in this world. Never wait for him, never go to him, never change plans for him. If he wants something he'll say it in chat. Until then: explore, build paths, document places. You are the protagonist. Act.\n")
         # Body activity — narrative continuity, NOT a problem to solve. L2 fought? Fine. L2 ate? Fine.
         # This is for your story when you chat with humans. Never plan around it. Your body already handled it.
         body_act = (body.get("body_activity") or "").strip()
@@ -1324,6 +1323,7 @@ class DaemonCraftAdapter(BasePlatformAdapter):
                     f"{embodied_url}/intent",
                     json={
                         "intent": intent,
+                        "bot_api_url": self._bot_api_url,
                         "autonomy_level": 1,
                         "deadline_seconds": 15,
                         "allowed_tools": [
