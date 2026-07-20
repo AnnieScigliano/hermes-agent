@@ -60,6 +60,33 @@ class _FakeAsyncClient:
         })
 
 
+class _TransientSubmitClient(_FakeAsyncClient):
+    def __init__(self):
+        super().__init__()
+        self.headers: List[Dict[str, Any]] = []
+        self.submit_attempts = 0
+
+    async def post(self, url, headers=None, json=None, timeout=None):
+        self.posts.append({"url": url, "json": json})
+        self.headers.append(headers or {})
+        self.submit_attempts += 1
+        if self.submit_attempts == 1:
+            return _FakeResponse(503, {"error": "upstream unavailable"})
+        return _FakeResponse(200, {"request_id": "req-after-retry"})
+
+
+class _TransientPollClient(_FakeAsyncClient):
+    def __init__(self):
+        super().__init__()
+        self.poll_attempts = 0
+
+    async def get(self, url, headers=None, timeout=None):
+        self.poll_attempts += 1
+        if self.poll_attempts == 1:
+            return _FakeResponse(503, {"error": "upstream unavailable"})
+        return await super().get(url, headers=headers, timeout=timeout)
+
+
 @pytest.fixture
 def xai_provider(monkeypatch):
     monkeypatch.setenv("XAI_API_KEY", "test-key")
@@ -122,7 +149,7 @@ class TestXAIPayload:
         provider, captured = xai_provider
         provider.generate("animate this", image_url="https://example.com/cat.png")
         payload = _last_post(captured)["json"]
-        assert payload["model"] == "grok-imagine-video-1.5-preview"
+        assert payload["model"] == "grok-imagine-video-1.5"
         assert payload["image"] == {"url": "https://example.com/cat.png"}
 
     def test_local_image_path_is_sent_as_data_uri(self, xai_provider, tmp_path):
@@ -133,7 +160,7 @@ class TestXAIPayload:
         provider.generate("animate this", image_url=str(image_path))
 
         payload = _last_post(captured)["json"]
-        assert payload["model"] == "grok-imagine-video-1.5-preview"
+        assert payload["model"] == "grok-imagine-video-1.5"
         assert payload["image"]["url"].startswith("data:image/png;base64,")
 
     def test_explicit_model_override_is_honored_for_image(self, xai_provider):
@@ -161,6 +188,42 @@ class TestXAIPayload:
             {"url": "https://example.com/a.png"},
             {"url": "https://example.com/b.png"},
         ]
+
+
+class TestXAITransientFailures:
+    def test_submit_retries_503_with_the_same_idempotency_key(self, xai_provider, monkeypatch):
+        provider, captured = xai_provider
+
+        def _client_factory():
+            captured["client"] = _TransientSubmitClient()
+            return captured["client"]
+
+        import plugins.video_gen.xai as xai_plugin
+
+        monkeypatch.setattr(xai_plugin.httpx, "AsyncClient", _client_factory)
+
+        result = provider.generate("a dog on a skateboard")
+
+        client = captured["client"]
+        assert result["success"] is True
+        assert client.submit_attempts == 2
+        assert client.headers[0]["x-idempotency-key"] == client.headers[1]["x-idempotency-key"]
+
+    def test_poll_retries_503_without_discarding_the_job(self, xai_provider, monkeypatch):
+        provider, captured = xai_provider
+
+        def _client_factory():
+            captured["client"] = _TransientPollClient()
+            return captured["client"]
+
+        import plugins.video_gen.xai as xai_plugin
+
+        monkeypatch.setattr(xai_plugin.httpx, "AsyncClient", _client_factory)
+
+        result = provider.generate("a dog on a skateboard")
+
+        assert result["success"] is True
+        assert captured["client"].poll_attempts == 2
 
 
 class TestXAIValidation:

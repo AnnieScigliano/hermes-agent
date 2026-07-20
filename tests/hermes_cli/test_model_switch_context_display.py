@@ -89,6 +89,22 @@ class TestResolveDisplayContextLength:
             )
         assert ctx == 128_000
 
+    def test_kimi_k3_short_alias_uses_kimi_coding_context(self):
+        """The Kimi Code ``k3`` alias has a 1M window, not the 256K fallback."""
+        from agent import model_metadata as mm
+
+        with patch.object(mm, "get_cached_context_length", return_value=None), \
+             patch.object(mm, "fetch_endpoint_model_metadata", return_value={}), \
+             patch.object(mm, "fetch_model_metadata", return_value={}), \
+             patch("agent.models_dev.fetch_models_dev", return_value={}):
+            ctx = resolve_display_context_length(
+                "k3",
+                "kimi-for-coding",
+                base_url="https://api.kimi.com/coding/v1",
+            )
+
+        assert ctx == 1_048_576
+
     def test_custom_providers_override_honored(self):
         """Regression for #15779: /model switch onto a custom provider must
         surface the configured per-model context_length, not the 128K/256K
@@ -146,3 +162,30 @@ class TestResolveDisplayContextLength:
                 custom_providers=custom_provs,
             )
         assert ctx == 400_000
+
+    def test_without_custom_providers_returns_default_fallback(self):
+        """Regression for #59314: When custom_providers is NOT passed
+        (the bug pre-fix), a custom provider model falls through to
+        probe-down default (256K) instead of the configured per-model
+        context_length."""
+        from unittest.mock import patch as _p
+        from agent import model_metadata as _mm
+        with _p.object(_mm, "get_cached_context_length", return_value=None), \
+             _p.object(_mm, "fetch_endpoint_model_metadata", return_value={}), \
+             _p.object(_mm, "fetch_model_metadata", return_value={}), \
+             _p.object(_mm, "is_local_endpoint", return_value=False), \
+             _p.object(_mm, "_is_known_provider_base_url", return_value=False):
+            # Without custom_providers, the function probes and gets default
+            ctx = resolve_display_context_length(
+                "test-model-unconfigured",
+                "custom",
+                base_url="https://example.invalid/v1",
+                api_key="k",
+                model_info=None,
+            )
+        # Without custom_providers, the function falls to probe-down default
+        assert ctx == 256_000, (
+            "Without custom_providers, an un-cached model gets 256K default. "
+            "The fix ensures custom_providers is passed so per-model overrides "
+            "are honored."
+        )
