@@ -18928,7 +18928,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # turn and must not be baked into the cached agent constructor.
             # If a profile is active, override the cached system prompt so the
             # agent does not load the global SOUL.md from SQLite session storage.
-            _profile_name = getattr(source, "profile", None)
+            # _profile_name is defined earlier (DC-134 block).
             if _profile_name and combined_ephemeral:
                 agent._cached_system_prompt = combined_ephemeral
 
