@@ -235,7 +235,10 @@ class DaemonCraftAdapter(BasePlatformAdapter):
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # is_reconnect is accepted to match BasePlatformAdapter.connect() (nico's
+        # reconnection-watcher API). This adapter performs full init on every
+        # connect, so cold-boot and reconnect follow the same path.
         if not self._bot_api_url:
             logger.error("[DaemonCraft] bot_api_url missing in platform config extra")
             return False
